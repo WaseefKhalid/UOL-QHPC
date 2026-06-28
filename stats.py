@@ -49,24 +49,6 @@ def career_bowling(bowl):
     return pd.DataFrame(rows, columns=BOWL_COLS).sort_values("Wkts", ascending=False, ignore_index=True)
 
 
-def suggest_similar_names(names):
-    """Return likely same-player name pairs to help merge scorer variations."""
-    from difflib import SequenceMatcher
-    names = sorted({n for n in names if isinstance(n, str) and n.strip()})
-    out = []
-    for i, a in enumerate(names):
-        ta = set(a.lower().split())
-        for b in names[i + 1:]:
-            tb = set(b.lower().split())
-            ratio = SequenceMatcher(None, a.lower(), b.lower()).ratio()
-            subset = bool(ta and tb and (ta <= tb or tb <= ta))
-            if ratio >= 0.82 or subset:
-                out.append({"Name 1": a, "Name 2": b, "Similarity": round(ratio, 2),
-                            "Why": "one name contains the other" if subset and ratio < 0.82 else "similar spelling"})
-    out.sort(key=lambda r: r["Similarity"], reverse=True)
-    return pd.DataFrame(out, columns=["Name 1", "Name 2", "Similarity", "Why"])
-
-
 # ---------------- Name cleanup helpers ----------------
 import difflib
 from collections import defaultdict
