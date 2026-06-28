@@ -6,7 +6,7 @@ import streamlit as st
 
 import db
 from parser import parse_stumps_pdf
-from stats import career_batting, career_bowling
+from stats import career_batting, career_bowling, suggest_name_groups, suggest_similar_names
 
 st.set_page_config(page_title="QHPC Cricket Stats", page_icon="🏏", layout="wide")
 
@@ -32,8 +32,8 @@ with st.sidebar:
     c2.metric("Players", len(players))
 
 st.title("QHPC Cricket Stats")
-tab_add, tab_players, tab_board, tab_matches = st.tabs(
-    ["➕  Add matches", "👤  Player profiles", "📊  Leaderboards", "📋  Matches"])
+tab_add, tab_players, tab_board, tab_matches, tab_manage = st.tabs(
+    ["➕  Add matches", "👤  Player profiles", "📊  Leaderboards", "📋  Matches", "🛠  Manage"])
 
 # ---------------- Add matches ----------------
 with tab_add:
@@ -219,3 +219,59 @@ with tab_matches:
             st.download_button("Download cricket-db.xlsx", f.read(),
                                file_name="qhpc-cricket-db.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ---------------- Manage (merge names, delete) ----------------
+with tab_manage:
+    st.subheader("Merge duplicate player names")
+    st.caption("Scorers often spell the same player differently. Pick the spellings that "
+               "are the same person and merge them into one — all their stats combine.")
+    if len(players) < 2:
+        st.info("Not enough players yet to look for duplicates.")
+    else:
+        sugg = suggest_similar_names(players)
+        if sugg.empty:
+            st.caption("No obviously similar names found right now.")
+        else:
+            st.markdown("**Possible matches found:**")
+            st.dataframe(sugg, hide_index=True, width="stretch")
+
+        sel = st.multiselect("Select every spelling of ONE player", players)
+        canonical = ""
+        if sel:
+            canonical = st.selectbox("Keep this spelling", sel)
+            typed = st.text_input("…or type the correct name instead (optional)")
+            if typed.strip():
+                canonical = typed.strip()
+        can_merge = len(sel) >= 2 and bool(canonical)
+        if st.button("🔗  Merge selected names", type="primary", disabled=not can_merge):
+            n = db.rename_player(sel, canonical)
+            st.success(f"Merged {len(sel)} spellings into '{canonical}' ({n} entries updated).")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Delete a match")
+    if m_df.empty:
+        st.caption("No matches saved.")
+    else:
+        opts = {f"{r['date']} · {r['team_a']} vs {r['team_b']}  ({r['match_id']})": r["match_id"]
+                for _, r in m_df.iterrows()}
+        pick = st.selectbox("Match to delete", list(opts.keys()))
+        sure = st.checkbox("Yes — delete this match and all its stats")
+        if st.button("🗑  Delete match", disabled=not sure):
+            db.delete_match(opts[pick])
+            st.success("Match deleted.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Delete a team's stats")
+    st.caption("Removes that team's batting and bowling rows (match fixtures stay in the Matches list).")
+    teams_all = sorted(set(bat_df["team"].dropna()) | set(bowl_df["team"].dropna()))
+    if not teams_all:
+        st.caption("No team data.")
+    else:
+        tpick = st.selectbox("Team", teams_all)
+        sure2 = st.checkbox("Yes — remove all of this team's player stats")
+        if st.button("🗑  Delete team stats", disabled=not sure2):
+            db.delete_team(tpick)
+            st.success(f"Removed {tpick}'s stats.")
+            st.rerun()
