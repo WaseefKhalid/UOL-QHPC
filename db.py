@@ -144,6 +144,67 @@ def append_match(parsed, match_type, our_side):
     return len(bat_rows), len(bowl_rows)
 
 
+INT_COLS = {
+    "matches": [],
+    "batting": ["runs", "balls", "fours", "sixes"],
+    "bowling": ["maidens", "runs", "wickets", "dots", "fours_conceded",
+                "sixes_conceded", "wides", "no_balls"],
+}
+
+
+def _save_full(name, df):
+    """Overwrite the whole table (used by delete and merge)."""
+    df = df.reindex(columns=COLUMNS[name]).copy()
+    for c in INT_COLS[name]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    if use_sheets():
+        ws = _worksheet(name)
+        ws.clear()
+        values = [COLUMNS[name]] + df.fillna("").astype(object).values.tolist()
+        ws.append_rows(values, value_input_option="USER_ENTERED")
+    else:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df.to_csv(_csv_path(name), index=False)
+    clear_cache()
+
+
+def delete_match(match_id):
+    """Remove a match and all its batting/bowling rows."""
+    match_id = str(match_id)
+    for name in ("matches", "batting", "bowling"):
+        df = load(name)
+        df = df[df["match_id"].astype(str) != match_id]
+        _save_full(name, df)
+
+
+def delete_team(team):
+    """Remove a team's batting and bowling rows (match fixtures are left in place)."""
+    for name in ("batting", "bowling"):
+        df = load(name)
+        df = df[df["team"] != team]
+        _save_full(name, df)
+
+
+def rename_player(old_names, new_name):
+    """Merge one or more name spellings into a single canonical name."""
+    old = set(old_names) - {new_name}
+    if not old:
+        return 0
+    changed = 0
+    bat = load("batting")
+    for col in ("player", "bowler", "fielder"):
+        mask = bat[col].isin(old)
+        changed += int(mask.sum()) if col == "player" else 0
+        bat.loc[mask, col] = new_name
+    _save_full("batting", bat)
+    bowl = load("bowling")
+    mask = bowl["player"].isin(old)
+    changed += int(mask.sum())
+    bowl.loc[mask, "player"] = new_name
+    _save_full("bowling", bowl)
+    return changed
+
+
 def export_excel(path):
     from stats import career_batting, career_bowling
     bat, bowl = load("batting"), load("bowling")
@@ -154,3 +215,64 @@ def export_excel(path):
         career_batting(bat).to_excel(xl, sheet_name="Career Batting", index=False)
         career_bowling(bowl).to_excel(xl, sheet_name="Career Bowling", index=False)
     return path
+
+
+# ---------------- Edit / cleanup operations ----------------
+def _overwrite(name, df):
+    """Replace an entire table with df (used by delete and merge)."""
+    df = df.reindex(columns=COLUMNS[name]).copy()
+    df = df.where(pd.notna(df), "")
+    if use_sheets():
+        ws = _worksheet(name)
+        ws.clear()
+        values = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in df.values.tolist()]
+        ws.update([COLUMNS[name]] + values, value_input_option="USER_ENTERED")
+    else:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df.to_csv(_csv_path(name), index=False)
+    clear_cache()
+
+
+def delete_match(match_id):
+    """Remove a match and all its batting/bowling rows."""
+    for name in ("matches", "batting", "bowling"):
+        df = load(name)
+        if not df.empty:
+            _overwrite(name, df[df["match_id"].astype(str) != str(match_id)])
+    clear_cache()
+
+
+def delete_team(team):
+    """Remove all batting/bowling rows for a team (match records are kept)."""
+    for name in ("batting", "bowling"):
+        df = load(name)
+        if not df.empty:
+            _overwrite(name, df[df["team"] != team])
+    clear_cache()
+
+
+def merge_players(variants, canonical):
+    """Rename every occurrence of `variants` to `canonical` across player, bowler and fielder."""
+    bat = load("batting")
+    if not bat.empty:
+        for col in ("player", "bowler", "fielder"):
+            bat[col] = bat[col].replace(variants, canonical)
+        _overwrite("batting", bat)
+    bowl = load("bowling")
+    if not bowl.empty:
+        bowl["player"] = bowl["player"].replace(variants, canonical)
+        _overwrite("bowling", bowl)
+    clear_cache()
+
+
+def rename_player(variants, canonical):
+    """UI-facing merge: rename `variants` to `canonical`, return how many entries changed."""
+    targets = [v for v in variants if v != canonical]
+    bat, bowl = load("batting"), load("bowling")
+    n = 0
+    if not bat.empty:
+        n += int(bat[["player", "bowler", "fielder"]].isin(targets).to_numpy().sum())
+    if not bowl.empty:
+        n += int(bowl[["player"]].isin(targets).to_numpy().sum())
+    merge_players(variants, canonical)
+    return n
