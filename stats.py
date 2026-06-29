@@ -67,25 +67,20 @@ def _similar(a, b, threshold):
 
 
 def suggest_name_groups(names, threshold=0.85):
-    """Cluster look-alike names. Returns groups (lists) of 2+ similar names to review."""
+    """Group look-alike names. Each group is anchored to one fuller name, so a shared
+    first name (Ali, Abdullah, Muhammad) no longer chains many players into one blob."""
     names = [n for n in dict.fromkeys(names) if isinstance(n, str) and n.strip()]
-    parent = {n: n for n in names}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            if _similar(names[i], names[j], threshold):
-                parent[find(names[i])] = find(names[j])
-
-    groups = defaultdict(list)
-    for n in names:
-        groups[find(n)].append(n)
-    return sorted([sorted(g) for g in groups.values() if len(g) > 1])
+    order = sorted(names, key=lambda n: (-len(n), n))   # fuller names act as anchors first
+    used, groups = set(), []
+    for seed in order:
+        if seed in used:
+            continue
+        group = [seed] + [o for o in names
+                          if o != seed and o not in used and _similar(seed, o, threshold)]
+        if len(group) > 1:
+            used.update(group)
+            groups.append(sorted(group))
+    return sorted(groups)
 
 
 def suggest_similar_names(names, threshold=0.85):
