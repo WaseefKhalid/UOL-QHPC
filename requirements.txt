@@ -3,3 +3,5 @@ pdfplumber
 pandas
 openpyxl
 gspread
+pytesseract
+Pillow
