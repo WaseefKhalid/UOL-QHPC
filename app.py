@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 import db
-from parser import parse_stumps_pdf
+from parser import parse_stumps_pdf, parse_summary_image
 from stats import career_batting, career_bowling, suggest_name_groups, suggest_similar_names
 
 st.set_page_config(page_title="QHPC Cricket Stats", page_icon="🏏", layout="wide")
@@ -46,75 +46,72 @@ with tab_add:
     pdfs = [u for u in (ups or []) if u.name.lower().endswith(".pdf")]
     imgs = [u for u in (ups or []) if not u.name.lower().endswith(".pdf")]
 
-    # ----- PDFs: parse + batch save -----
-    if pdfs:
-        st.markdown(f"#### {len(pdfs)} PDF(s)")
+    # ----- Parse every uploaded file: PDFs directly, screenshots via OCR -----
+    files = pdfs + imgs
+    if files:
         if "parsed" not in st.session_state:
             st.session_state.parsed = {}
         items = []
-        for u in pdfs:
+        for u in files:
             key = f"{u.name}-{u.size}"
+            is_pdf = u.name.lower().endswith(".pdf")
             if key not in st.session_state.parsed:
                 try:
-                    st.session_state.parsed[key] = parse_stumps_pdf(io.BytesIO(u.getvalue()))
+                    if is_pdf:
+                        st.session_state.parsed[key] = parse_stumps_pdf(io.BytesIO(u.getvalue()))
+                    else:
+                        with st.spinner(f"Reading {u.name}…"):
+                            st.session_state.parsed[key] = parse_summary_image(io.BytesIO(u.getvalue()))
                 except Exception as e:
                     st.session_state.parsed[key] = {"error": str(e)}
-            items.append((u.name, st.session_state.parsed[key]))
+            items.append((u.name, is_pdf, u, st.session_state.parsed[key]))
 
-        overview, distinct_teams = [], set()
-        for name, p in items:
+        overview = []
+        for name, is_pdf, u, p in items:
+            kind = "PDF" if is_pdf else "Screenshot"
             if "error" in p:
-                overview.append({"File": name, "Match": "could not read", "Status": p["error"][:40]})
+                overview.append({"File": name, "Type": kind, "Match": "could not read", "Status": str(p["error"])[:40]})
                 continue
             mt = p["meta"]
-            distinct_teams.update(t for t in (mt["team_a"], mt["team_b"]) if t)
-            overview.append({"File": name,
+            overview.append({"File": name, "Type": kind,
                              "Match": f'{mt["team_a"]} vs {mt["team_b"]}',
-                             "Result": mt["result"],
+                             "Read": f'{len(p["batting"])} bat / {len(p["bowling"])} bowl',
                              "Status": "already saved" if db.match_exists(mt["match_id"]) else "new"})
         st.dataframe(pd.DataFrame(overview), hide_index=True, width="stretch")
 
-        teams = sorted(distinct_teams)
-        if match_type == "inter":
-            idx = teams.index(st.session_state.our_team) if st.session_state.our_team in teams else 0
-            our_side = st.selectbox("Which team is ours?", teams, index=idx) if teams else st.session_state.our_team
-            st.caption(f"Only **{our_side}** players will be saved from each match.")
-        else:
-            our_side = st.session_state.our_team
+        # screenshots: show image next to what OCR read, so you can eyeball before saving
+        for name, is_pdf, u, p in items:
+            if not is_pdf and "error" not in p and p["batting"]:
+                with st.expander(f"Check what was read from {name}"):
+                    ic, dc = st.columns([1, 1])
+                    ic.image(u.getvalue(), width="stretch")
+                    dc.dataframe(pd.DataFrame(p["batting"])[["team", "player", "runs", "balls"]],
+                                 hide_index=True, width="stretch")
+                    dc.dataframe(pd.DataFrame(p["bowling"])[["team", "player", "wickets", "runs"]],
+                                 hide_index=True, width="stretch")
 
+        our_side = st.session_state.our_team
         if st.button("✅  Save all new matches", type="primary"):
-            saved = skipped = missing = 0
-            for name, p in items:
+            saved = skipped = errs = 0
+            for name, is_pdf, u, p in items:
                 if "error" in p:
+                    errs += 1
                     continue
-                mt = p["meta"]
-                if db.match_exists(mt["match_id"]):
+                if db.match_exists(p["meta"]["match_id"]):
                     skipped += 1
                     continue
-                if match_type == "inter" and our_side not in (mt["team_a"], mt["team_b"]):
-                    missing += 1
-                    continue
-                db.append_match(p, match_type, our_side)
+                db.append_match(p, "intra", our_side)
                 saved += 1
             msg = f"Saved {saved} new match(es)."
             if skipped:
-                msg += f" Skipped {skipped} already in the database."
-            if missing:
-                msg += f" {missing} skipped — '{our_side}' wasn't a team in them (check the name)."
+                msg += f" Skipped {skipped} already saved."
+            if errs:
+                msg += f" {errs} couldn't be read."
             st.success(msg)
             st.session_state.parsed = {}
             st.balloons()
 
-    # ----- Screenshots: show image + manual entry -----
-    if imgs:
-        st.markdown(f"#### {len(imgs)} screenshot(s)")
-        st.caption("The summary screenshot only lists the top batters and bowlers, so screenshots "
-                   "are entered by hand below. Use the images as your reference.")
-        gcols = st.columns(min(3, len(imgs)))
-        for i, u in enumerate(imgs):
-            gcols[i % len(gcols)].image(u.getvalue(), caption=u.name, width="stretch")
-
-    with st.expander("Add a match from a screenshot (manual entry)", expanded=bool(imgs)):
+    with st.expander("Add a match by hand (fallback if a screenshot won't read)"):
         st.caption("Type what you can read. Leave blanks as 0.")
         mc1, mc2 = st.columns(2)
         ta = mc1.text_input("Team A", key="m_ta")
