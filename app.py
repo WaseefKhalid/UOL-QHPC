@@ -234,6 +234,12 @@ with tab_manage:
     if len(players) < 2:
         st.info("Not enough players yet to look for duplicates.")
     else:
+        # apply a pending reset / success message from the previous run (before widgets are drawn)
+        if st.session_state.pop("merge_reset", False):
+            st.session_state["merge_ms"] = []
+        if st.session_state.get("merge_done"):
+            st.success(st.session_state.pop("merge_done"))
+
         groups = suggest_name_groups(players)
         if not groups:
             st.caption("No obviously similar names found right now.")
@@ -256,8 +262,8 @@ with tab_manage:
         can_merge = len(sel) >= 2 and bool(canonical)
         if st.button("🔗  Merge selected names", type="primary", disabled=not can_merge):
             n = db.rename_player(sel, canonical)
-            st.success(f"Merged {len(sel)} spellings into '{canonical}' ({n} entries updated).")
-            st.session_state["merge_ms"] = []
+            st.session_state["merge_done"] = f"Merged {len(sel)} spellings into '{canonical}' ({n} entries updated)."
+            st.session_state["merge_reset"] = True
             st.rerun()
 
     st.divider()
