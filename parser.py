@@ -152,3 +152,85 @@ def parse_stumps_pdf(file_like):
                 bowling.append(row)
 
     return {"meta": meta, "batting": batting, "bowling": bowling}
+
+
+# ---------------- Summary screenshot (OCR) ----------------
+def _ocr_image(file_like):
+    import pytesseract
+    from PIL import Image, ImageOps
+    img = Image.open(file_like).convert("RGB")
+    g = ImageOps.grayscale(img)
+    g = ImageOps.invert(g)                       # summary is light text on a dark background
+    g = g.resize((g.width * 2, g.height * 2))    # upscale helps OCR
+    return pytesseract.image_to_string(g, config="--psm 6")
+
+
+def parse_summary_image(file_like):
+    """Read a STUMPS summary screenshot and return the same structure as parse_stumps_pdf
+    (only the top batters/bowlers shown in the summary are captured)."""
+    raw = _ocr_image(file_like)
+    lines = [re.sub(r"\s+", " ", l).strip() for l in raw.split("\n") if l.strip()]
+
+    match_id = ""
+    for l in lines:
+        m = re.search(r"#\s*([A-Za-z0-9]{5,})", l)
+        if m:
+            match_id = m.group(1)
+            break
+
+    result = ""
+    for l in lines:
+        if re.search(r"\b(won by|tied|match drawn|drawn|no result)\b", l, re.I):
+            result = re.sub(r"\s*[;:.\-_,]+\s*$", "", l).strip()
+            break
+
+    header_re = re.compile(r"^(.+?)\s+Overs\s+([\d.]+)\s+(\d+-\d+)\b", re.I)
+    row_re = re.compile(
+        r"^(?P<bat>.+?)\s+(?P<runs>\d+)(?P<no>\*?)\s*\((?P<balls>\d+)\)\s+"
+        r"(?P<bowl>.+?)\s+(?P<w>\d+)\s*-\s*(?P<r>\d+)\b")
+
+    teams, scores = [], []
+    blocks = []          # list of (batting_team_index, [rows])
+    cur = None
+    for l in lines:
+        h = header_re.match(l)
+        if h:
+            teams.append(h.group(1).strip())
+            scores.append(f"{h.group(3)} in {h.group(2)} overs")
+            cur = {"team_idx": len(teams) - 1, "rows": []}
+            blocks.append(cur)
+            continue
+        r = row_re.match(l)
+        if r and cur is not None:
+            cur["rows"].append(r.groupdict())
+
+    team_a = teams[0] if len(teams) > 0 else ""
+    team_b = teams[1] if len(teams) > 1 else ""
+    score_a = scores[0] if len(scores) > 0 else ""
+    score_b = scores[1] if len(scores) > 1 else ""
+
+    if not match_id:                              # no readable id -> stable id from the scoreline
+        import hashlib
+        key = f"{team_a}{score_a}{team_b}{score_b}{result}".lower()
+        match_id = "ss-" + hashlib.md5(key.encode()).hexdigest()[:8]
+
+    batting, bowling = [], []
+    for blk in blocks:
+        bat_team = teams[blk["team_idx"]] if blk["team_idx"] < len(teams) else ""
+        bowl_team = team_b if bat_team == team_a else team_a
+        for d in blk["rows"]:
+            runs, balls = int(d["runs"]), int(d["balls"])
+            batting.append({
+                "team": bat_team, "player": d["bat"].strip(),
+                "how_out": "not out" if d["no"] else "other", "bowler": "", "fielder": "",
+                "runs": runs, "balls": balls, "fours": 0, "sixes": 0,
+                "sr": round(runs / balls * 100, 2) if balls else 0})
+            bowling.append({
+                "team": bowl_team, "player": d["bowl"].strip(),
+                "overs": 0.0, "maidens": 0, "runs": int(d["r"]), "wickets": int(d["w"]),
+                "econ": 0, "dots": 0, "fours_conceded": 0, "sixes_conceded": 0,
+                "wides": 0, "no_balls": 0})
+
+    meta = {"match_id": match_id, "date": "", "format": "", "overs": "", "result": result,
+            "toss": "", "team_a": team_a, "team_b": team_b, "score_a": score_a, "score_b": score_b}
+    return {"meta": meta, "batting": batting, "bowling": bowling}
