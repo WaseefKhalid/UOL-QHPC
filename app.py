@@ -37,10 +37,7 @@ tab_add, tab_players, tab_board, tab_matches, tab_manage = st.tabs(
 
 # ---------------- Add matches ----------------
 with tab_add:
-    match_type = st.radio(
-        "Match type for this upload", ["intra", "inter"], horizontal=True,
-        format_func=lambda x: "Intra-academy — save both teams" if x == "intra"
-        else "Inter-academy — save our players only")
+    match_type = "intra"  # every upload saves both teams; trim a side later via Manage if needed
 
     ups = st.file_uploader(
         "Drop in one or more files — STUMPS PDFs and/or summary screenshots",
@@ -126,8 +123,7 @@ with tab_add:
         sb = mc2.text_input("Team B score", key="m_sb")
         res = st.text_input("Result", key="m_res", placeholder="e.g. UOL QHPC won by 15 runs")
         m_date = st.date_input("Date", value=dt.date.today(), key="m_date")
-        m_type = st.radio("Match type", ["intra", "inter"], horizontal=True, key="m_type",
-                          format_func=lambda x: "Intra — both teams" if x == "intra" else "Inter — our players only")
+        m_type = "intra"  # manual entries save both teams too
         m_side = st.selectbox("Which team is ours?", [t for t in [ta, tb] if t] or ["—"], key="m_side")
 
         st.markdown("**Batting** (one row per batter)")
@@ -175,28 +171,38 @@ with tab_players:
         cb, cbw = career_batting(bat_df), career_bowling(bowl_df)
         prow, wrow = cb[cb["Player"] == player], cbw[cbw["Player"] == player]
         st.markdown(f"### {player}")
-        if not prow.empty:
-            r = prow.iloc[0]
-            st.markdown("**Batting**")
-            for col, (lbl, v) in zip(st.columns(7), [
-                    ("Inns", r["Inns"]), ("Runs", r["Runs"]), ("HS", r["HS"]),
-                    ("Avg", r["Avg"] if pd.notna(r["Avg"]) else "—"),
-                    ("SR", r["SR"] if pd.notna(r["SR"]) else "—"),
-                    ("50s", r["50s"]), ("Catches", r["Catches"])]):
-                col.metric(lbl, v)
-        if not wrow.empty:
-            r = wrow.iloc[0]
-            st.markdown("**Bowling**")
-            for col, (lbl, v) in zip(st.columns(6), [
-                    ("Inns", r["Inns"]), ("Wkts", r["Wkts"]), ("Best", r["Best"]),
-                    ("Avg", r["Avg"] if pd.notna(r["Avg"]) else "—"),
-                    ("Econ", r["Econ"] if pd.notna(r["Econ"]) else "—"), ("Overs", r["Overs"])]):
-                col.metric(lbl, v)
-        pb = bat_df[bat_df["player"] == player]
-        if not pb.empty:
-            st.markdown("**Match by match**")
-            st.dataframe(pb[["date", "team", "how_out", "runs", "balls", "fours", "sixes"]],
-                         hide_index=True, width="stretch")
+        view = st.radio("Show", ["Batting", "Bowling"], horizontal=True, key="profile_view")
+        if view == "Batting":
+            if prow.empty:
+                st.caption("No batting record for this player.")
+            else:
+                r = prow.iloc[0]
+                for col, (lbl, v) in zip(st.columns(7), [
+                        ("Inns", r["Inns"]), ("Runs", r["Runs"]), ("HS", r["HS"]),
+                        ("Avg", r["Avg"] if pd.notna(r["Avg"]) else "—"),
+                        ("SR", r["SR"] if pd.notna(r["SR"]) else "—"),
+                        ("50s", r["50s"]), ("Catches", r["Catches"])]):
+                    col.metric(lbl, v)
+                pb = bat_df[bat_df["player"] == player]
+                if not pb.empty:
+                    st.markdown("**Match by match**")
+                    st.dataframe(pb[["date", "team", "how_out", "runs", "balls", "fours", "sixes"]],
+                                 hide_index=True, width="stretch")
+        else:
+            if wrow.empty:
+                st.caption("No bowling record for this player.")
+            else:
+                r = wrow.iloc[0]
+                for col, (lbl, v) in zip(st.columns(6), [
+                        ("Inns", r["Inns"]), ("Wkts", r["Wkts"]), ("Best", r["Best"]),
+                        ("Avg", r["Avg"] if pd.notna(r["Avg"]) else "—"),
+                        ("Econ", r["Econ"] if pd.notna(r["Econ"]) else "—"), ("Overs", r["Overs"])]):
+                    col.metric(lbl, v)
+                wbm = bowl_df[bowl_df["player"] == player]
+                if not wbm.empty:
+                    st.markdown("**Match by match**")
+                    st.dataframe(wbm[["date", "team", "overs", "maidens", "runs", "wickets", "econ"]],
+                                 hide_index=True, width="stretch")
 
 # ---------------- Leaderboards ----------------
 with tab_board:
@@ -228,24 +234,30 @@ with tab_manage:
     if len(players) < 2:
         st.info("Not enough players yet to look for duplicates.")
     else:
-        sugg = suggest_similar_names(players)
-        if sugg.empty:
+        groups = suggest_name_groups(players)
+        if not groups:
             st.caption("No obviously similar names found right now.")
         else:
-            st.markdown("**Possible matches found:**")
-            st.dataframe(sugg, hide_index=True, width="stretch")
+            st.markdown("**Possible matches found** — pick one to load it below:")
+            labels = [", ".join(g) for g in groups]
+            choice = st.selectbox("Suggested groups", ["—"] + labels, key="grp_choice")
+            if st.button("⬇️  Load this group") and choice != "—":
+                st.session_state["merge_ms"] = groups[labels.index(choice)]
+                st.rerun()
 
-        sel = st.multiselect("Select every spelling of ONE player", players)
+        st.markdown("**Spellings of ONE player** — remove any that don't belong, then merge:")
+        sel = st.multiselect("Names (you can add or remove)", players, key="merge_ms")
         canonical = ""
         if sel:
-            canonical = st.selectbox("Keep this spelling", sel)
-            typed = st.text_input("…or type the correct name instead (optional)")
+            canonical = st.selectbox("Keep this spelling", sel, key="merge_keep")
+            typed = st.text_input("…or type the correct name instead (optional)", key="merge_typed")
             if typed.strip():
                 canonical = typed.strip()
         can_merge = len(sel) >= 2 and bool(canonical)
         if st.button("🔗  Merge selected names", type="primary", disabled=not can_merge):
             n = db.rename_player(sel, canonical)
             st.success(f"Merged {len(sel)} spellings into '{canonical}' ({n} entries updated).")
+            st.session_state["merge_ms"] = []
             st.rerun()
 
     st.divider()
