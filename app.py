@@ -267,6 +267,45 @@ with tab_manage:
             st.rerun()
 
     st.divider()
+    st.subheader("Merge from the full name list")
+    st.caption("Every name at once. Tick the ones that are the same player, "
+               "choose the spelling to keep, and merge.")
+    if not players:
+        st.caption("No players yet.")
+    else:
+        if st.session_state.pop("allnames_reset", False) and "allnames_editor" in st.session_state:
+            del st.session_state["allnames_editor"]
+        if st.session_state.get("allnames_done"):
+            st.success(st.session_state.pop("allnames_done"))
+
+        bat_counts = bat_df["player"].value_counts()
+        bowl_counts = bowl_df["player"].value_counts()
+        names_df = pd.DataFrame({"Merge?": False, "Player": players})
+        names_df["Entries"] = names_df["Player"].map(
+            lambda p: int(bat_counts.get(p, 0)) + int(bowl_counts.get(p, 0)))
+        edited = st.data_editor(
+            names_df, hide_index=True, width="stretch", height=420, key="allnames_editor",
+            column_config={
+                "Merge?": st.column_config.CheckboxColumn("Merge?", width="small"),
+                "Player": st.column_config.TextColumn("Player", disabled=True),
+                "Entries": st.column_config.NumberColumn("Entries", disabled=True,
+                                                         help="batting + bowling innings on record"),
+            })
+        picked = edited[edited["Merge?"]]["Player"].tolist()
+        if picked:
+            st.write("**Selected:** " + ", ".join(picked))
+            canon3 = st.selectbox("Keep this spelling", picked, key="allnames_keep")
+            typed3 = st.text_input("…or type the correct name instead (optional)", key="allnames_typed")
+            if typed3.strip():
+                canon3 = typed3.strip()
+            if st.button("🔗  Merge these names", type="primary",
+                         disabled=len(picked) < 2, key="allnames_merge"):
+                n = db.rename_player(picked, canon3)
+                st.session_state["allnames_done"] = f"Merged {len(picked)} names into '{canon3}' ({n} entries updated)."
+                st.session_state["allnames_reset"] = True
+                st.rerun()
+
+    st.divider()
     st.subheader("Delete a match")
     if m_df.empty:
         st.caption("No matches saved.")
