@@ -92,17 +92,22 @@ with tab_add:
 
         our_side = st.session_state.our_team
         if st.button("✅  Save all new matches", type="primary"):
-            saved = skipped = errs = 0
+            existing = set(db.load("matches")["match_id"].astype(str))
+            to_save, seen, skipped, errs = [], set(), 0, 0
             for name, is_pdf, u, p in items:
                 if "error" in p:
                     errs += 1
                     continue
-                if db.match_exists(p["meta"]["match_id"]):
+                mid = str(p["meta"]["match_id"])
+                if mid in existing or mid in seen:
                     skipped += 1
                     continue
-                db.append_match(p, "intra", our_side)
-                saved += 1
-            msg = f"Saved {saved} new match(es)."
+                seen.add(mid)
+                to_save.append(p)
+            if to_save:
+                with st.spinner(f"Saving {len(to_save)} match(es) to your sheet…"):
+                    db.append_many(to_save, "intra", our_side)
+            msg = f"Saved {len(to_save)} new match(es)."
             if skipped:
                 msg += f" Skipped {skipped} already saved."
             if errs:
