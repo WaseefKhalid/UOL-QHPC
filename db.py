@@ -1,12 +1,12 @@
 """Data store with two backends, chosen automatically:
-- Google Sheets  -> used when Streamlit secrets contain `gcp_service_account` + `sheet_key`
-                    (this is what makes the deployed app remember data permanently).
+- Google Sheets  -> used when Streamlit secrets contain `gcp_service_account` + `sheet_key`.
 - Local CSV      -> used on your own machine when no secrets are set.
 
-The rest of the app calls the same functions either way:
-load(name), append_match(...), match_exists(id), export_excel(path), clear_cache().
+Google Sheets calls are cached and batched, with automatic back-off on rate limits,
+so bulk uploads stay under Google's per-minute quota.
 """
 import os
+import time
 import pandas as pd
 import streamlit as st
 
@@ -40,6 +40,29 @@ def backend_label():
     return "Online (Google Sheets)" if use_sheets() else "Local (this computer)"
 
 
+# ---------------- Google Sheets backend (cached + rate-limit safe) ----------------
+def _retry(fn, *args, **kwargs):
+    """Call a gspread function, backing off and retrying if Google returns a rate limit (429)."""
+    import gspread
+    last = None
+    for i in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            last = e
+            status = None
+            try:
+                status = e.response.status_code
+            except Exception:
+                pass
+            if status == 429:
+                time.sleep(2 * (i + 1))
+                continue
+            raise
+    if last:
+        raise last
+
+
 @st.cache_resource(show_spinner=False)
 def _spreadsheet():
     import gspread
@@ -47,33 +70,46 @@ def _spreadsheet():
     return gc.open_by_key(st.secrets["sheet_key"])
 
 
-def _worksheet(name):
-    import gspread
+@st.cache_resource(show_spinner=False)
+def _ensure_tabs():
     sh = _spreadsheet()
-    try:
-        ws = sh.worksheet(name)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=len(COLUMNS[name]))
-    if not ws.get_all_values():
-        ws.update([COLUMNS[name]])
-    return ws
+    titles = [ws.title for ws in _retry(sh.worksheets)]
+    for name in COLUMNS:
+        if name not in titles:
+            ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(COLUMNS[name]))
+            _retry(ws.update, [COLUMNS[name]])
+    return True
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_resource(show_spinner=False)
+def _ws(name):
+    _ensure_tabs()
+    return _spreadsheet().worksheet(name)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def _sheets_load(name):
-    ws = _worksheet(name)
-    records = ws.get_all_records()
+    ws = _ws(name)
+    records = _retry(ws.get_all_records)
     return pd.DataFrame(records, columns=COLUMNS[name]) if records else pd.DataFrame(columns=COLUMNS[name])
 
 
 def _sheets_append(name, rows):
     if not rows:
         return
-    ws = _worksheet(name)
+    ws = _ws(name)
     values = [[r.get(c, "") for c in COLUMNS[name]] for r in rows]
-    ws.append_rows(values, value_input_option="USER_ENTERED")
+    _retry(ws.append_rows, values, value_input_option="USER_ENTERED")
 
 
+def _sheets_overwrite(name, df):
+    ws = _ws(name)
+    _retry(ws.clear)
+    values = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in df.values.tolist()]
+    _retry(ws.update, [COLUMNS[name]] + values, value_input_option="USER_ENTERED")
+
+
+# ---------------- Local CSV backend ----------------
 def _csv_path(name):
     return os.path.join(DATA_DIR, f"{name}.csv")
 
@@ -93,6 +129,7 @@ def _csv_append(name, rows):
     df.to_csv(_csv_path(name), index=False)
 
 
+# ---------------- public API ----------------
 def load(name):
     df = _sheets_load(name) if use_sheets() else _csv_load(name)
     df = df.reindex(columns=COLUMNS[name])
@@ -108,6 +145,17 @@ def _append(name, rows):
         _csv_append(name, rows)
 
 
+def _overwrite(name, df):
+    df = df.reindex(columns=COLUMNS[name]).copy()
+    df = df.where(pd.notna(df), "")
+    if use_sheets():
+        _sheets_overwrite(name, df)
+    else:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df.to_csv(_csv_path(name), index=False)
+    clear_cache()
+
+
 def clear_cache():
     try:
         st.cache_data.clear()
@@ -120,121 +168,42 @@ def match_exists(match_id):
     return not df.empty and str(match_id) in df["match_id"].astype(str).values
 
 
-def append_match(parsed, match_type, our_side):
-    """intra keeps both teams; inter keeps `our_side` only."""
+def _rows_for(parsed, match_type, our_side):
     meta = parsed["meta"]
     keep = lambda team: match_type == "intra" or team == our_side
-
-    _append("matches", [{
+    match_row = {
         "match_id": meta["match_id"], "date": meta["date"], "type": match_type,
         "our_team": our_side, "team_a": meta["team_a"], "score_a": meta["score_a"],
         "team_b": meta["team_b"], "score_b": meta["score_b"], "result": meta["result"],
         "format": meta["format"], "overs": meta["overs"], "toss": meta["toss"],
-    }])
+    }
+    bat = [{**b, "match_id": meta["match_id"], "date": meta["date"], "type": match_type,
+            "is_ours": b["team"] == our_side} for b in parsed["batting"] if keep(b["team"])]
+    bowl = [{**b, "match_id": meta["match_id"], "date": meta["date"], "type": match_type,
+             "is_ours": b["team"] == our_side} for b in parsed["bowling"] if keep(b["team"])]
+    return match_row, bat, bowl
 
-    bat_rows = [{**b, "match_id": meta["match_id"], "date": meta["date"], "type": match_type,
-                 "is_ours": b["team"] == our_side} for b in parsed["batting"] if keep(b["team"])]
-    _append("batting", bat_rows)
 
-    bowl_rows = [{**b, "match_id": meta["match_id"], "date": meta["date"], "type": match_type,
-                  "is_ours": b["team"] == our_side} for b in parsed["bowling"] if keep(b["team"])]
-    _append("bowling", bowl_rows)
-
+def append_many(parsed_list, match_type, our_side):
+    """Save several matches in just 3 write calls total (one per tab)."""
+    all_m, all_b, all_w = [], [], []
+    for p in parsed_list:
+        m, b, w = _rows_for(p, match_type, our_side)
+        all_m.append(m)
+        all_b += b
+        all_w += w
+    _append("matches", all_m)
+    _append("batting", all_b)
+    _append("bowling", all_w)
     clear_cache()
-    return len(bat_rows), len(bowl_rows)
+    return len(all_b), len(all_w)
 
 
-INT_COLS = {
-    "matches": [],
-    "batting": ["runs", "balls", "fours", "sixes"],
-    "bowling": ["maidens", "runs", "wickets", "dots", "fours_conceded",
-                "sixes_conceded", "wides", "no_balls"],
-}
-
-
-def _save_full(name, df):
-    """Overwrite the whole table (used by delete and merge)."""
-    df = df.reindex(columns=COLUMNS[name]).copy()
-    for c in INT_COLS[name]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-    if use_sheets():
-        ws = _worksheet(name)
-        ws.clear()
-        values = [COLUMNS[name]] + df.fillna("").astype(object).values.tolist()
-        ws.append_rows(values, value_input_option="USER_ENTERED")
-    else:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        df.to_csv(_csv_path(name), index=False)
-    clear_cache()
+def append_match(parsed, match_type, our_side):
+    return append_many([parsed], match_type, our_side)
 
 
 def delete_match(match_id):
-    """Remove a match and all its batting/bowling rows."""
-    match_id = str(match_id)
-    for name in ("matches", "batting", "bowling"):
-        df = load(name)
-        df = df[df["match_id"].astype(str) != match_id]
-        _save_full(name, df)
-
-
-def delete_team(team):
-    """Remove a team's batting and bowling rows (match fixtures are left in place)."""
-    for name in ("batting", "bowling"):
-        df = load(name)
-        df = df[df["team"] != team]
-        _save_full(name, df)
-
-
-def rename_player(old_names, new_name):
-    """Merge one or more name spellings into a single canonical name."""
-    old = set(old_names) - {new_name}
-    if not old:
-        return 0
-    changed = 0
-    bat = load("batting")
-    for col in ("player", "bowler", "fielder"):
-        mask = bat[col].isin(old)
-        changed += int(mask.sum()) if col == "player" else 0
-        bat.loc[mask, col] = new_name
-    _save_full("batting", bat)
-    bowl = load("bowling")
-    mask = bowl["player"].isin(old)
-    changed += int(mask.sum())
-    bowl.loc[mask, "player"] = new_name
-    _save_full("bowling", bowl)
-    return changed
-
-
-def export_excel(path):
-    from stats import career_batting, career_bowling
-    bat, bowl = load("batting"), load("bowling")
-    with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        load("matches").to_excel(xl, sheet_name="Matches", index=False)
-        bat.to_excel(xl, sheet_name="Batting", index=False)
-        bowl.to_excel(xl, sheet_name="Bowling", index=False)
-        career_batting(bat).to_excel(xl, sheet_name="Career Batting", index=False)
-        career_bowling(bowl).to_excel(xl, sheet_name="Career Bowling", index=False)
-    return path
-
-
-# ---------------- Edit / cleanup operations ----------------
-def _overwrite(name, df):
-    """Replace an entire table with df (used by delete and merge)."""
-    df = df.reindex(columns=COLUMNS[name]).copy()
-    df = df.where(pd.notna(df), "")
-    if use_sheets():
-        ws = _worksheet(name)
-        ws.clear()
-        values = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in df.values.tolist()]
-        ws.update([COLUMNS[name]] + values, value_input_option="USER_ENTERED")
-    else:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        df.to_csv(_csv_path(name), index=False)
-    clear_cache()
-
-
-def delete_match(match_id):
-    """Remove a match and all its batting/bowling rows."""
     for name in ("matches", "batting", "bowling"):
         df = load(name)
         if not df.empty:
@@ -243,7 +212,6 @@ def delete_match(match_id):
 
 
 def delete_team(team):
-    """Remove all batting/bowling rows for a team (match records are kept)."""
     for name in ("batting", "bowling"):
         df = load(name)
         if not df.empty:
@@ -252,7 +220,6 @@ def delete_team(team):
 
 
 def merge_players(variants, canonical):
-    """Rename every occurrence of `variants` to `canonical` across player, bowler and fielder."""
     bat = load("batting")
     if not bat.empty:
         for col in ("player", "bowler", "fielder"):
@@ -266,7 +233,6 @@ def merge_players(variants, canonical):
 
 
 def rename_player(variants, canonical):
-    """UI-facing merge: rename `variants` to `canonical`, return how many entries changed."""
     targets = [v for v in variants if v != canonical]
     bat, bowl = load("batting"), load("bowling")
     n = 0
@@ -276,3 +242,15 @@ def rename_player(variants, canonical):
         n += int(bowl[["player"]].isin(targets).to_numpy().sum())
     merge_players(variants, canonical)
     return n
+
+
+def export_excel(path):
+    from stats import career_batting, career_bowling
+    bat, bowl = load("batting"), load("bowling")
+    with pd.ExcelWriter(path, engine="openpyxl") as xl:
+        load("matches").to_excel(xl, sheet_name="Matches", index=False)
+        bat.to_excel(xl, sheet_name="Batting", index=False)
+        bowl.to_excel(xl, sheet_name="Bowling", index=False)
+        career_batting(bat).to_excel(xl, sheet_name="Career Batting", index=False)
+        career_bowling(bowl).to_excel(xl, sheet_name="Career Bowling", index=False)
+    return path
