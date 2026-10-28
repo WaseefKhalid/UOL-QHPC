@@ -18,11 +18,6 @@ CSS = f"""
 <style>
 .block-container {{ padding-top: 4.2rem; padding-bottom: 1rem; max-width: 1440px; }}
 #MainMenu, footer {{ visibility: hidden; }}
-@media (max-width: 640px) {{
-  .block-container {{ padding-top: 4.4rem; }}
-  .qh-title {{ font-size: 1.7rem; }}
-  .qh-meta {{ text-align: left; }}
-}}
 
 /* masthead */
 .qh-mast {{ display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap;
@@ -119,6 +114,47 @@ CSS = f"""
 /* footer */
 .qh-foot {{ border-top: 1px solid {LINE}; margin-top: 32px; padding-top: 10px; color: #7A8A82;
            font-size: .75rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; }}
+.qh-cards.sm {{ grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; }}
+.qh-cards.sm .qh-card {{ padding: 9px 12px; }}
+.qh-cards.sm .val {{ font-size: 1.35rem; }}
+
+/* ---------- phones ---------- */
+@media (max-width: 640px) {{
+  .block-container {{ padding: 4.2rem 0.85rem 1rem; }}
+  .qh-mast {{ gap: 6px; padding-bottom: 10px; }}
+  .qh-mast img {{ height: 42px; }}
+  .qh-eyebrow {{ font-size: .6rem; letter-spacing: .12em; }}
+  .qh-title {{ font-size: 1.55rem; }}
+  .qh-sub {{ font-size: .78rem; }}
+  .qh-meta {{ text-align: left; font-size: .76rem; }}
+  .qh-scope {{ font-size: .78rem; padding: 7px 10px; margin: 8px 0 4px; }}
+  .qh-note {{ font-size: .74rem; }}
+  .stTabs [data-baseweb="tab-list"] {{ gap: 0; }}
+  .stTabs [data-baseweb="tab"] {{ padding: 8px 9px; font-size: .84rem; }}
+  .qh-cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 4px 0 12px; }}
+  .qh-cards.sm {{ grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }}
+  .qh-card {{ padding: 8px 10px; border-left-width: 3px; }}
+  .qh-card .lbl {{ font-size: .58rem; letter-spacing: .08em; }}
+  .qh-card .val {{ font-size: 1.2rem; }}
+  .qh-cards.sm .val {{ font-size: 1.05rem; }}
+  .qh-card .who {{ font-size: .72rem; }}
+  .qh-h .t {{ font-size: 1.05rem; }}
+  .qh-top-h {{ padding: 8px 12px; }}
+  .qh-top-h .t {{ font-size: 1rem; }}
+  .qh-top-h .s {{ font-size: .6rem; }}
+  .qh-hero {{ padding: 12px; gap: 10px; }}
+  .qh-hero .rk {{ width: 28px; height: 28px; font-size: .85rem; }}
+  .qh-hero .nm {{ font-size: 1rem; }}
+  .qh-hero .dt {{ font-size: .72rem; }}
+  .qh-hero .vl {{ font-size: 1.7rem; }}
+  .qh-row {{ padding: 8px 12px; gap: 8px; }}
+  .qh-row .nm {{ font-size: .9rem; }}
+  .qh-row .dt {{ font-size: .7rem; }}
+  .qh-row .vl {{ font-size: .95rem; }}
+  .qh-form span {{ min-width: 26px; height: 26px; font-size: .74rem; }}
+  .qh-foot {{ flex-direction: column; font-size: .7rem; }}
+  h3 {{ font-size: 1.35rem !important; }}
+}}
 </style>
 """
 
@@ -168,13 +204,13 @@ def sidebar_brand():
 </div>""", unsafe_allow_html=True)
 
 
-def cards(items):
-    """items: list of (label, value, who)."""
+def cards(items, small=False):
+    """items: list of (label, value, who). small=True for compact stat tiles."""
     body = "".join(
         f'<div class="qh-card"><div class="lbl">{esc(l)}</div><div class="val">{esc(v)}</div>'
         f'<div class="who">{esc(w) if w else "&nbsp;"}</div></div>'
         for l, v, w in items)
-    st.markdown(f'<div class="qh-cards">{body}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="qh-cards{" sm" if small else ""}">{body}</div>', unsafe_allow_html=True)
 
 
 def section(num, title):
@@ -371,6 +407,103 @@ def share_card_png(card):
     fr = card.get("footer_right", "")
     f = _font("regular", 24)
     d.text((W - P - d.textlength(fr, font=f), H - 80), fr, font=f, fill=(205, 233, 217))
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+
+def _ellipsize(draw, text, font, max_w):
+    text = str(text)
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    while text and draw.textlength(text + "…", font=font) > max_w:
+        text = text[:-1]
+    return text.rstrip(" ·,") + "…"
+
+
+def list_png(title, subtitle, rows, scope="", footer_right=""):
+    """A ranked list graphic: #1 as a big hero row, the rest below. rows: [(name, value, detail)].
+    Returns PNG bytes, 1080×1350 (fits WhatsApp and Instagram)."""
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    W, H, P = 1080, 1350, 64
+    deep, mid, bright, tint, pale = map(_hex, (DEEP, MID, BRIGHT, TINT, PALE))
+    mint, white, ink, muted = _hex("#8FD4B0"), (255, 255, 255), _hex(INK), _hex(MUTED)
+    img = Image.new("RGB", (W, H), white)
+    d = ImageDraw.Draw(img)
+
+    band = 300
+    d.rectangle([0, 0, W, band], fill=deep)
+    d.rectangle([0, 0, W, 14], fill=bright)
+    if os.path.exists(LOGO):
+        try:
+            logo = Image.open(LOGO).convert("RGBA")
+            logo.thumbnail((110, 110))
+            img.paste(logo, (W - P - logo.width, 48), logo)
+        except Exception:
+            pass
+    _spaced(d, (P, 54), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), mint, 3.2)
+    tf = _fit(d, title, "serif", 84, W - 2 * P - 120, 48)
+    d.text((P, 94), title, font=tf, fill=white)
+    sf = _fit(d, subtitle, "regular", 32, W - 2 * P, 20)
+    d.text((P, 214), subtitle, font=sf, fill=(205, 233, 217))
+
+    foot = 112
+    top, bottom = band + 30, H - foot - 26
+    if not rows:
+        f = _font("regular", 36)
+        msg = "No data in these filters yet"
+        d.text(((W - d.textlength(msg, font=f)) / 2, (top + bottom) / 2 - 20), msg, font=f, fill=muted)
+    else:
+        rest = rows[1:]
+        hero_h = 220 if len(rest) <= 5 else 196
+        row_h = min(128, (bottom - top - hero_h - 14) / max(len(rest), 1))
+        block = hero_h + 14 + row_h * len(rest)
+        top += max(0, (bottom - top - block) / 2)     # centre short lists vertically
+        big = row_h >= 110
+        # hero (#1)
+        n, v, det = rows[0]
+        d.rounded_rectangle([P, top, W - P, top + hero_h], radius=18, fill=tint)
+        d.rectangle([P, top + 18, P + 8, top + hero_h - 18], fill=bright)
+        cx, cy, r = P + 64, top + hero_h / 2, 38
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=bright)
+        f1 = _font("bold", 42)
+        d.text((cx - d.textlength("1", font=f1) / 2, cy - 25), "1", font=f1, fill=white)
+        vf = _fit(d, str(v), "bold", 124, 340, 60)
+        vw = d.textlength(str(v), font=vf)
+        d.text((W - P - 30 - vw, top + hero_h / 2 - 72), str(v), font=vf, fill=deep)
+        name_w = W - P - 30 - vw - 30 - (P + 124)
+        nf = _fit(d, n, "bold", 60, name_w, 32)
+        d.text((P + 124, top + hero_h / 2 - 66), _ellipsize(d, n, nf, name_w), font=nf, fill=deep)
+        df = _font("regular", 29)
+        d.text((P + 124, top + hero_h / 2 + 14), _ellipsize(d, det, df, W - P - 30 - (P + 124)), font=df,
+               fill=_hex("#44544C"))
+        # the rest
+        y = top + hero_h + 14
+        sizes = (40, 26, 56, 36) if big else ((34, 22, 46, 34) if row_h >= 80 else (30, 20, 38, 30))
+        for i, (n, v, det) in enumerate(rest, start=2):
+            if i % 2 == 0:
+                d.rounded_rectangle([P, y, W - P, y + row_h - 6], radius=12, fill=pale)
+            mid_y = y + (row_h - 6) / 2
+            ns, ds, vs, rs = sizes
+            rf = _font("bold", rs)
+            d.text((P + 26, mid_y - rs * 0.62), str(i), font=rf, fill=mid)
+            vf = _font("bold", vs)
+            vw = d.textlength(str(v), font=vf)
+            d.text((W - P - 26 - vw, mid_y - vs * 0.62), str(v), font=vf, fill=deep)
+            avail = W - P - 26 - vw - 24 - (P + 90)
+            nf, dfs = _font("bold", ns), _font("regular", ds)
+            d.text((P + 90, mid_y - ns - 2), _ellipsize(d, n, nf, avail), font=nf, fill=ink)
+            d.text((P + 90, mid_y + 8), _ellipsize(d, det, dfs, avail), font=dfs, fill=muted)
+            y += row_h
+
+    d.rectangle([0, H - foot, W, H], fill=deep)
+    d.text((P, H - 86), "UOL QHPC Cricket Stats", font=_font("serif", 34), fill=white)
+    sc = _font("regular", 22)
+    d.text((P, H - 44), _ellipsize(d, scope, sc, W - 2 * P - 260), font=sc, fill=mint)
+    f = _font("regular", 24)
+    d.text((W - P - d.textlength(footer_right, font=f), H - 80), footer_right, font=f, fill=(205, 233, 217))
     buf = BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
