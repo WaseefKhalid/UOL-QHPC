@@ -12,6 +12,7 @@ import db
 import ui
 from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CHOICES, guess_ball,
+                   overs_from_scorecard,
                    guess_outcome, closest_name, name_clusters, team_record, record_table,
                    guess_type, career_batting, career_bowling, batting_by_position, player_overview,
                    enrich, filter_rows, suggest_name_groups, search_names, team_matches, default_side,
@@ -142,13 +143,12 @@ FMT_OTHER = "Other…"
 
 
 def match_details(fk, mt, side, labels, known_opps, known_formats):
-    """Opponent / venue / result / format / ball for one uploaded match. Returns a dict;
-    `missing` lists what still has to be picked."""
+    """Opponent / venue / result, then format / overs / ball for one uploaded match.
+    Returns a dict; `missing` lists what still has to be picked."""
     d = {"opponent": "", "venue": "", "outcome": ""}
     normal = side in ("A", "B")
-    cols = st.columns(5 if normal else 2)
-    i = 0
     if normal:
+        cols = st.columns(3)
         file_opp = labels["B" if side == "A" else "A"]
         suggested = closest_name(file_opp, known_opps)
         opts = list(dict.fromkeys([x for x in (suggested, file_opp) if x] + known_opps)) + [TYPE_OTHER]
@@ -166,19 +166,27 @@ def match_details(fk, mt, side, labels, known_opps, known_formats):
                                          index=OUTCOMES.index(g) if g else None, placeholder="Pick…")
         if g and d["outcome"] == g:
             cols[2].caption("From the scorecard")
-        i = 3
+
+    cols = st.columns(3)
     file_fmt = (mt.get("format") or "").strip()
-    fmt_opts = list(dict.fromkeys(([file_fmt] if file_fmt else []) + FORMAT_CHOICES + known_formats)) + [FMT_OTHER]
-    fmt = cols[i].selectbox("Match format", fmt_opts, index=0 if file_fmt else None, key=f"fmt_{fk}",
-                            placeholder="Pick…")
+    fmt_opts = list(dict.fromkeys(FORMAT_CHOICES + known_formats)) + [FMT_OTHER]
+    fmt = cols[0].selectbox("Match format", fmt_opts, index=None, key=f"fmt_{fk}", placeholder="Pick…")
     if fmt == FMT_OTHER:
-        fmt = cols[i].text_input("Format", key=f"fmtt_{fk}", placeholder="Type the format",
+        fmt = cols[0].text_input("Format", key=f"fmtt_{fk}", placeholder="Type your own format",
                                  label_visibility="collapsed").strip()
+    elif not fmt and file_fmt:
+        cols[0].caption(f"Scorecard says “{file_fmt}”")
     d["format"] = fmt or ""
-    guess = guess_ball(d["format"], mt.get("overs"))
-    d["ball"] = cols[i + 1].selectbox("Ball", list(BALLS), key=f"ball_{fk}_{short_hash(d['format'])}",
-                                      index=BALLS.index(guess) if guess else None, placeholder="Pick…")
-    need = (["opponent", "venue", "outcome"] if normal else []) + ["format", "ball"]
+    sc_overs = overs_from_scorecard(mt)
+    overs = cols[1].number_input("Overs per side", min_value=1, max_value=200, step=1, value=sc_overs,
+                                 key=f"ov_{fk}", placeholder="e.g. 20")
+    if sc_overs and overs == sc_overs:
+        cols[1].caption("From the scorecard")
+    d["overs"] = str(int(overs)) if overs else ""
+    guess = guess_ball(file_fmt, d["overs"]) or guess_ball(d["format"], d["overs"])
+    d["ball"] = cols[2].selectbox("Ball", list(BALLS), key=f"ball_{fk}_{short_hash(d['format'] + d['overs'])}",
+                                  index=BALLS.index(guess) if guess else None, placeholder="Pick…")
+    need = (["opponent", "venue", "outcome"] if normal else []) + ["format", "overs", "ball"]
     d["missing"] = [k for k in need if not d.get(k)]
     return d
 
@@ -518,14 +526,14 @@ if IS_ADMIN:
             for c, _, side, d in live:
                 if side in ("A", "B", "AB"):
                     c["p"]["meta"].update({k: d.get(k, "") for k in
-                                           ("ball", "venue", "opponent", "outcome", "format")})
+                                           ("ball", "venue", "opponent", "outcome", "format", "overs")})
                     to_save.append((c["p"], set(side)))
             to_replace = sorted({str(c["saved"]["match_id"]) for c, action, side, _d in live
                                  if action == "replace" and side in ("A", "B", "AB")})
             if pending:
                 st.warning(f"Pick your side for {pending} match(es) — or choose “Skip this match”.")
             if no_ball:
-                st.warning(f"Fill in the match details (opponent, venue, result, format, ball) for "
+                st.warning(f"Fill in the match details (opponent, venue, result, format, overs, ball) for "
                            f"{no_ball} match(es).")
 
             # ---- your bowlers with no bowling type yet: ask once per player, pace or spin
@@ -590,7 +598,8 @@ if IS_ADMIN:
                                      key="m_format", index=None, placeholder="Pick…")
             if m_format == FMT_OTHER:
                 m_format = mc4.text_input("Type the format", key="m_format_typed")
-            m_overs = mc5.text_input("Overs per side", key="m_overs", placeholder="e.g. 20")
+            m_overs = mc5.number_input("Overs per side", min_value=1, max_value=200, step=1, value=None,
+                                       key="m_overs", placeholder="e.g. 20")
             mc6, mc7, mc8 = st.columns(3)
             m_venue = mc6.radio("Venue", list(VENUES), index=None, horizontal=True, key="m_venue")
             m_outcome = mc7.selectbox("Result for us", list(OUTCOMES), index=None, key="m_outcome",
@@ -614,7 +623,8 @@ if IS_ADMIN:
                 team = ta.strip()
                 mid = f"manual-{int(time.time())}"
                 p = {"meta": {"match_id": mid, "date": str(m_date), "format": (m_format or "").strip(),
-                              "overs": m_overs.strip(), "result": res, "toss": "", "team_a": team,
+                              "overs": str(int(m_overs)) if m_overs else "", "result": res, "toss": "",
+                              "team_a": team,
                               "ball": m_ball or "", "venue": m_venue or "", "outcome": m_outcome or "",
                               "opponent": tb.strip(),
                               "team_b": tb.strip(), "score_a": sa, "score_b": sb}, "batting": [], "bowling": []}
@@ -643,8 +653,8 @@ if IS_ADMIN:
                            if b["player"] not in types and b["player"] not in typed_types]
                 if not (p["batting"] or p["bowling"]):
                     st.warning("Add at least one batter or bowler before saving.")
-                elif not (tb.strip() and m_venue and m_outcome and m_format):
-                    st.warning("Fill in the opponent, venue, result and match format.")
+                elif not (tb.strip() and m_venue and m_outcome and m_format and m_overs):
+                    st.warning("Fill in the opponent, venue, result, match format and overs.")
                 elif not m_ball:
                     st.warning("Pick white ball or red ball.")
                 elif no_type:
@@ -979,13 +989,16 @@ if IS_ADMIN:
                 "Opponent": [o if n else INTRA for o, n in zip(mv["opponent_label"], normal)],
                 "Venue": [v if v in VENUES else None for v in mv["venue_label"]],
                 "Result": [o if o in OUTCOMES else None for o in mv["outcome_label"]],
-                "Format": mv["format"], "Ball": [b if b in BALLS else None for b in mv["ball_label"]],
+                "Format": [f or None for f in mv["format"]],
+                "Overs": pd.to_numeric(mv["overs"], errors="coerce"),
+                "Ball": [b if b in BALLS else None for b in mv["ball_label"]],
                 "Us": mv["our_score"], "Them": mv["opp_score"], "Scorecard result": mv["result"],
             }).reset_index(drop=True)
             ids = mv["match_id"].tolist()
             st.caption("Opponent, venue, result, format and ball can be corrected here: edit the cells, "
                        "then press Save.")
             edit_cols = {"Opponent": "opponent", "Venue": "venue", "Result": "outcome", "Format": "format",
+                         "Overs": "overs",
                          "Ball": "ball"}
             edited = st.data_editor(
                 table, hide_index=True, width="stretch", key=f"m_ed_{short_hash('|'.join(ids))}",
@@ -993,6 +1006,9 @@ if IS_ADMIN:
                 column_config={
                     "Venue": st.column_config.SelectboxColumn("Venue", options=list(VENUES)),
                     "Result": st.column_config.SelectboxColumn("Result", options=list(OUTCOMES)),
+                    "Format": st.column_config.SelectboxColumn(
+                        "Format", options=list(dict.fromkeys(FORMAT_CHOICES + known_formats))),
+                    "Overs": st.column_config.NumberColumn("Overs", min_value=1, max_value=200, step=1),
                     "Ball": st.column_config.SelectboxColumn("Ball", options=list(BALLS))})
             changes = {}
             for i, mid in enumerate(ids):
@@ -1000,8 +1016,9 @@ if IS_ADMIN:
                     old, new = table.at[i, col], edited.at[i, col]
                     if col == "Opponent" and (not normal[i] or not str(new or "").strip()):
                         continue
-                    if pd.notna(new) and new != old and str(new).strip():
-                        changes.setdefault(mid, {})[field] = str(new).strip()
+                    if pd.notna(new) and not (pd.notna(old) and new == old) and str(new).strip():
+                        changes.setdefault(mid, {})[field] = (str(int(new)) if col == "Overs"
+                                                              else str(new).strip())
             n_changes = sum(len(v) for v in changes.values())
             if st.button(f"💾  Save {n_changes} change(s)", disabled=not changes, key="m_ed_save"):
                 db.update_matches(changes)
