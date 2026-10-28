@@ -11,6 +11,8 @@ NO_FORMAT = "Not recorded"
 NOT_SET = "Not set"
 BALLS = ("White ball", "Red ball")
 VENUES = ("Home", "Away")
+TOSSES = ("Won", "Lost")
+INNINGS = ("Batted first", "Chased")
 OUTCOMES = ("Won", "Lost", "Tied", "Drawn", "No result")
 INTRA = "Intra-squad"
 FORMAT_CHOICES = ["Inter Academy Senior Team Match", "Inter Academy Junior Team Match",
@@ -241,6 +243,42 @@ def guess_outcome(result, team_a, team_b, our_side):
     return "Won" if winner == our_side else "Lost"
 
 
+def guess_toss(toss_text, team_a, team_b, our_side):
+    """'Won' / 'Lost' for your side from the scorecard's toss line (None if unclear).
+    The toss line names the team that won it."""
+    t = team_key(toss_text)
+    if not t or our_side not in ("A", "B"):
+        return None
+    named = [s for s, n in (("A", team_a), ("B", team_b)) if team_key(n) and team_key(n) in t]
+    if len(named) != 1:
+        m = re.search(r"^(.*?)\s+(?:won|wins|win)\b", str(toss_text), re.I)
+        winner = _side(m.group(1), team_a, team_b) if m else None
+    else:
+        winner = named[0]
+    if winner is None:
+        return None
+    return "Won" if winner == our_side else "Lost"
+
+
+def guess_innings(result, team_a, team_b, our_side, bat_first=""):
+    """'Batted first' / 'Chased' for your side. Uses the scorecard order when known,
+    otherwise the margin: a win 'by N runs' means the winner batted first, 'by N wickets' chased."""
+    if our_side not in ("A", "B"):
+        return None
+    first = _side(bat_first, team_a, team_b) if str(bat_first or "").strip() else None
+    if first is None:
+        m = re.search(r"^(.*?)\s+(?:won|win|beat|beats)\b.*?\bby\b.*?\b(runs?|wickets?|wkts?)\b",
+                      str(result or ""), re.I)
+        if not m:
+            return None
+        winner = _side(m.group(1), team_a, team_b)
+        if winner is None:
+            return None
+        loser = "B" if winner == "A" else "A"
+        first = winner if m.group(2).lower().startswith("run") else loser
+    return "Batted first" if first == our_side else "Chased"
+
+
 def match_table(m_df):
     m = m_df.copy()
     m["match_id"] = m["match_id"].astype(str)
@@ -252,8 +290,9 @@ def match_table(m_df):
     m["ball_label"] = col("ball").where(lambda b: b.isin(BALLS), NOT_SET)
     m["venue_label"] = col("venue").where(lambda v: v.isin(VENUES), NOT_SET)
 
-    sides, opps, ours, theirs, outcomes = [], [], [], [], []
-    for r, opp, out in zip(m.to_dict("records"), col("opponent"), col("outcome")):
+    sides, opps, ours, theirs, outcomes, tosses, inns = [], [], [], [], [], [], []
+    for r, opp, out, tos, inn in zip(m.to_dict("records"), col("opponent"), col("outcome"),
+                                     col("toss_result"), col("innings")):
         if r["type"] == "intra" or " & " in r["our_team"]:
             side = "AB"
         else:
@@ -266,13 +305,24 @@ def match_table(m_df):
             theirs.append(r[f"score_{other.lower()}"])
             outcomes.append(out if out in OUTCOMES else
                             (guess_outcome(r["result"], r["team_a"], r["team_b"], side) or NOT_SET))
+            tosses.append(tos if tos in TOSSES else
+                          (guess_toss(r.get("toss", ""), r["team_a"], r["team_b"], side) or NOT_SET))
+            inns.append(inn if inn in INNINGS else
+                        (guess_innings(r["result"], r["team_a"], r["team_b"], side) or NOT_SET))
         else:
             opps.append(opp)
             ours.append("")
             theirs.append("")
             outcomes.append(INTRA if side == "AB" else (out if out in OUTCOMES else NOT_SET))
+            tosses.append(NOT_SET)
+            inns.append(NOT_SET)
     m["our_side"], m["opponent_label"] = sides, opps
     m["our_score"], m["opp_score"], m["outcome_label"] = ours, theirs, outcomes
+    m["toss_label"], m["innings_label"] = tosses, inns
+    m["toss_innings"] = [
+        {("Won", "Batted first"): "Won toss · chose to bat", ("Won", "Chased"): "Won toss · chose to field",
+         ("Lost", "Batted first"): "Lost toss · put in to bat", ("Lost", "Chased"): "Lost toss · sent to field",
+         }.get((t, i), NOT_SET) for t, i in zip(tosses, inns)]
     return m
 
 
@@ -307,6 +357,7 @@ def enrich(m_df, bat, bowl, field=None):
         df["format_label"] = _lookup(df["match_id"], info["format_label"]).fillna(NO_FORMAT)
         df["ball_label"] = _lookup(df["match_id"], info["ball_label"]).fillna(NOT_SET)
         df["venue_label"] = _lookup(df["match_id"], info["venue_label"]).fillna(NOT_SET)
+        df["innings_label"] = _lookup(df["match_id"], info["innings_label"]).fillna(NOT_SET)
         ta = _lookup(df["match_id"], info["team_a"]).fillna("")
         tb = _lookup(df["match_id"], info["team_b"]).fillna("")
         df["opponent"] = np.where(df["team"] == ta, tb, np.where(df["team"] == tb, ta, ""))
@@ -341,7 +392,7 @@ def enrich(m_df, bat, bowl, field=None):
 
 
 def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None,
-                balls=None, venues=None):
+                balls=None, venues=None, innings=None):
     out = df
     if date_range:
         lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
@@ -359,6 +410,8 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
         out = out[out["ball_label"].isin(balls)]
     if venues:
         out = out[out["venue_label"].isin(venues)]
+    if innings:
+        out = out[out["innings_label"].isin(innings)]
     return out
 
 
@@ -698,3 +751,130 @@ def search_names(query, names, limit=25):
         if score >= 0.6:
             scored.append((score, n))
     return [n for _, n in sorted(scored, key=lambda x: -x[0])[:limit]], True
+
+
+# ---------------- MVP points ----------------
+POINTS = {
+    "run": 1, "four": 1, "six": 2, "30": 4, "50": 8, "100": 16,
+    "sr150": 6, "sr130": 4, "sr_min_balls": 10,
+    "wicket": 25, "3w": 8, "4w": 12, "5w": 16, "maiden": 4,
+    "econ5": 6, "econ6": 4, "econ7": 2, "econ_min_overs": 2,
+    "caught": 8, "caught & bowled": 8, "stumped": 12, "run out": 8,
+}
+
+POINTS_RULES = [
+    ("Batting", [
+        ("Each run", "1"), ("Each four (bonus)", "+1"), ("Each six (bonus)", "+2"),
+        ("30+ / 50+ / 100+ in an innings", "+4 / +8 / +16"),
+        ("Strike rate 130+ / 150+ (min 10 balls, white ball)", "+4 / +6")]),
+    ("Bowling", [
+        ("Each wicket", "25"), ("3 / 4 / 5+ wickets in an innings", "+8 / +12 / +16"),
+        ("Each maiden", "4"), ("Economy ≤7 / ≤6 / ≤5 (min 2 overs, white ball)", "+2 / +4 / +6")]),
+    ("Fielding", [("Each catch", "8"), ("Each stumping", "12"), ("Each run-out involvement", "8")]),
+]
+
+
+def _bat_points(r):
+    runs, balls = int(r["runs"]), int(r["balls"])
+    p = runs * POINTS["run"] + int(r["fours"]) * POINTS["four"] + int(r["sixes"]) * POINTS["six"]
+    p += POINTS["100"] if runs >= 100 else POINTS["50"] if runs >= 50 else POINTS["30"] if runs >= 30 else 0
+    if r.get("ball_label") != "Red ball" and balls >= POINTS["sr_min_balls"]:
+        sr = runs / balls * 100
+        p += POINTS["sr150"] if sr >= 150 else POINTS["sr130"] if sr >= 130 else 0
+    return p
+
+
+def _bowl_points(r):
+    w = int(r["wickets"])
+    p = w * POINTS["wicket"] + int(r["maidens"]) * POINTS["maiden"]
+    p += POINTS["5w"] if w >= 5 else POINTS["4w"] if w >= 4 else POINTS["3w"] if w >= 3 else 0
+    balls = overs_to_balls(r["overs"])
+    if r.get("ball_label") != "Red ball" and balls >= POINTS["econ_min_overs"] * 6:
+        econ = int(r["runs"]) / balls * 6
+        p += POINTS["econ5"] if econ <= 5 else POINTS["econ6"] if econ <= 6 else POINTS["econ7"] if econ <= 7 else 0
+    return p
+
+
+def match_points(bat, bowl, field):
+    """Points per player per match, with a short line describing the performance."""
+    frames = []
+    if not bat.empty:
+        b = bat.copy()
+        b["bat_pts"] = b.apply(_bat_points, axis=1)
+        b["line_bat"] = b["runs"].astype(int).astype(str) + np.where(b["how_out"] == "not out", "*", "") \
+            + " (" + b["balls"].astype(int).astype(str) + ")"
+        frames.append(b[["match_id", "player", "date_dt", "opponent", "bat_pts", "line_bat", "runs"]])
+    if not bowl.empty:
+        w = bowl.copy()
+        w["bowl_pts"] = w.apply(_bowl_points, axis=1)
+        w["line_bowl"] = w["wickets"].astype(int).astype(str) + "/" + w["runs"].astype(int).astype(str)
+        frames.append(w[["match_id", "player", "date_dt", "opponent", "bowl_pts", "line_bowl", "wickets"]])
+    if field is not None and not field.empty:
+        f = field.copy()
+        f["field_pts"] = f["dismissal"].map(POINTS).fillna(0)
+        f["catches"] = f["dismissal"].isin(["caught", "caught & bowled"]).astype(int)
+        frames.append(f[["match_id", "player", "date_dt", "opponent", "field_pts", "catches"]])
+    cols = ["match_id", "player", "date_dt", "opponent", "bat_pts", "bowl_pts", "field_pts", "total",
+            "line_bat", "line_bowl", "catches", "runs", "wickets"]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    allr = pd.concat(frames, ignore_index=True)
+    g = allr.groupby(["match_id", "player"], sort=False)
+    out = g.agg(date_dt=("date_dt", "first"), opponent=("opponent", "first"),
+                bat_pts=("bat_pts", "sum"), bowl_pts=("bowl_pts", "sum"), field_pts=("field_pts", "sum"),
+                catches=("catches", "sum"), runs=("runs", "sum"), wickets=("wickets", "sum"),
+                line_bat=("line_bat", "first"), line_bowl=("line_bowl", "first")).reset_index()
+    for c in ("bat_pts", "bowl_pts", "field_pts", "catches", "runs", "wickets"):
+        out[c] = out[c].fillna(0).astype(int)
+    out["total"] = out["bat_pts"] + out["bowl_pts"] + out["field_pts"]
+    return out[cols]
+
+
+def _perf_line(r):
+    parts = []
+    if isinstance(r["line_bat"], str):
+        parts.append(r["line_bat"])
+    if isinstance(r["line_bowl"], str) and (r["wickets"] or not parts):
+        parts.append(r["line_bowl"])
+    if r["catches"]:
+        parts.append(f"{r['catches']} ct")
+    return " & ".join(parts) if parts else "—"
+
+
+def players_of_match(mp):
+    """The top points scorer in each match (ties broken by runs, then wickets)."""
+    if mp.empty:
+        return mp.assign(performance=[])
+    best = (mp.sort_values(["total", "runs", "wickets"], ascending=False)
+              .drop_duplicates("match_id").sort_values("date_dt", ascending=False, na_position="last"))
+    best = best.assign(performance=best.apply(_perf_line, axis=1))
+    return best.reset_index(drop=True)
+
+
+def mvp_table(mp):
+    cols = ["Player", "Matches", "Batting", "Bowling", "Fielding", "Total", "Per match", "Best", "POTM"]
+    if mp.empty:
+        return pd.DataFrame(columns=cols)
+    potm = players_of_match(mp)["player"].value_counts()
+    t = mp.groupby("player").agg(Matches=("match_id", "nunique"), Batting=("bat_pts", "sum"),
+                                 Bowling=("bowl_pts", "sum"), Fielding=("field_pts", "sum"),
+                                 Total=("total", "sum"), Best=("total", "max")).reset_index()
+    t = t.rename(columns={"player": "Player"})
+    t["Per match"] = (t["Total"] / t["Matches"]).round(1)
+    t["POTM"] = t["Player"].map(potm).fillna(0).astype(int)
+    return t[cols].sort_values(["Total", "Per match"], ascending=False, ignore_index=True)
+
+
+# ---------------- how a batter got out ----------------
+HOW_OUT_LABELS = {"caught": "Caught", "bowled": "Bowled", "lbw": "LBW", "run out": "Run out",
+                  "stumped": "Stumped", "caught & bowled": "Caught & bowled", "other": "Other / not recorded"}
+
+
+def dismissal_breakdown(bat):
+    """How a batter's innings ended: times and share of dismissals (not-outs listed separately)."""
+    how = bat["how_out"].fillna("other").replace("", "other")
+    outs = how[how != "not out"]
+    counts = outs.map(lambda h: HOW_OUT_LABELS.get(h, "Other / not recorded")).value_counts()
+    out = pd.DataFrame({"How out": counts.index, "Times": counts.values})
+    out["% of dismissals"] = (out["Times"] / max(len(outs), 1) * 100).round(0)
+    return out, int((how == "not out").sum()), len(outs)
