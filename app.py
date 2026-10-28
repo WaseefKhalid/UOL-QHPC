@@ -725,7 +725,8 @@ def leaderboards(bat_f, field_f, bowl_f):
     q = c3.text_input("Find player", key="lb_q", placeholder="Filter the table by name")
     show_filter_note(batting=which == "Batting")
     if which == "Batting":
-        table = career_batting(bat_f, fielding=field_f)
+        # no batting-position column here: positions are chosen with the sidebar filter instead
+        table = career_batting(bat_f, fielding=field_f).drop(columns=["Pos"], errors="ignore")
     else:
         table = career_bowling(bowl_f)
     table = table[table["Inns"] >= min_inns]
@@ -734,8 +735,7 @@ def leaderboards(bat_f, field_f, bowl_f):
     if table.empty:
         st.info("Nothing to show with these filters.")
         return
-    cfg = {"Pos": st.column_config.NumberColumn("Pos", help="Most common batting position")}
-    st.dataframe(table, hide_index=True, width="stretch", column_config=cfg)
+    st.dataframe(table, hide_index=True, width="stretch")
     st.caption(f"{len(table)} player(s). Click a column header to sort.")
 
 
