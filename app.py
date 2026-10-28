@@ -302,7 +302,7 @@ def show_filter_note(batting=True):
 
 
 ui.masthead(len(matches), len(players), matches["date_dt"].max() if not matches.empty else None)
-TAB_LABELS = {"board": "📊  Leaderboards", "search": "🔎  Player search"}
+TAB_LABELS = {"top": "🏆  Top performers", "board": "📊  Leaderboards", "search": "🔎  Player search"}
 if IS_ADMIN:
     TAB_LABELS.update({"add": "➕  Add matches", "matches": "📋  Matches", "manage": "🛠  Manage"})
 TABS = dict(zip(TAB_LABELS, st.tabs(list(TAB_LABELS.values()))))
@@ -783,6 +783,49 @@ def leaderboards(bat_f, field_f, bowl_f):
     st.caption(f"{len(table)} player(s) · ranked by {'runs' if which == 'Batting' else 'wickets'}. "
                "Click a column header to sort.")
 
+
+def _num(v, dec=2):
+    return "—" if v is None or pd.isna(v) else f"{v:.{dec}f}"
+
+
+def _when(r):
+    parts = [f"vs {r['opponent']}" if r["opponent"] else "", f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "",
+             r["format_label"] if r["format_label"] != NO_FORMAT else ""]
+    return " · ".join(p for p in parts if p)
+
+
+@st.fragment
+def top_performers(bat_f, bowl_f):
+    show_filter_note(batting=True)
+    if bat_f.empty and bowl_f.empty:
+        st.info("No matches yet — check back soon.")
+        return
+    n = st.radio("Show", [5, 10], horizontal=True, key="tp_n", format_func=lambda k: f"Top {k}")
+    cb, cw = career_batting(bat_f), career_bowling(bowl_f)
+
+    most_runs = [(r["Player"], int(r["Runs"]), f"{r['Inns']} inns · avg {_num(r['Avg'])} · SR {_num(r['SR'])}")
+                 for _, r in cb.sort_values(["Runs", "SR"], ascending=[False, False]).head(n).iterrows()]
+    best_scores = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}",
+                    f"{int(r['balls'])} balls · {_when(r)}")
+                   for _, r in bat_f.assign(_no=bat_f["how_out"] == "not out")
+                   .sort_values(["runs", "_no", "balls"], ascending=[False, False, True]).head(n).iterrows()]
+    most_wkts = [(r["Player"], int(r["Wkts"]), f"{r['Inns']} inns · avg {_num(r['Avg'])} · econ {_num(r['Econ'])}")
+                 for _, r in cw[cw["Wkts"] > 0].sort_values(["Wkts", "Avg"], ascending=[False, True]).head(n).iterrows()]
+    spells = bowl_f[bowl_f["wickets"] > 0].sort_values(["wickets", "runs"], ascending=[False, True]).head(n)
+    best_figs = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
+                  f"{r['overs']:g} ov · {_when(r)}") for _, r in spells.iterrows()]
+
+    for left, right in ((("Most runs", "Batting", most_runs), ("Highest scores", "Single innings", best_scores)),
+                        (("Most wickets", "Bowling", most_wkts), ("Best bowling figures", "Single innings", best_figs))):
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            ui.top_list(*left)
+        with c2:
+            ui.top_list(*right)
+
+
+with TABS["top"]:
+    top_performers(bat_f, bowl_f)
 
 with TABS["board"]:
     leaderboards(bat_f, field_f, bowl_f)
