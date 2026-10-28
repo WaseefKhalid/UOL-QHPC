@@ -5,6 +5,7 @@ import hashlib
 import datetime as dt
 from itertools import combinations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -12,6 +13,8 @@ import db
 import ui
 from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CHOICES, guess_ball,
+                   TOSSES, INNINGS, guess_toss, guess_innings, POINTS_RULES, match_points,
+                   players_of_match, mvp_table, dismissal_breakdown, HOW_OUT_LABELS,
                    overs_from_scorecard,
                    guess_outcome, closest_name, name_clusters, team_record, record_table,
                    guess_type, career_batting, career_bowling, batting_by_position, player_overview,
@@ -145,10 +148,10 @@ FMT_OTHER = "Other…"
 def match_details(fk, mt, side, labels, known_opps, known_formats):
     """Opponent / venue / result, then format / overs / ball for one uploaded match.
     Returns a dict; `missing` lists what still has to be picked."""
-    d = {"opponent": "", "venue": "", "outcome": ""}
+    d = {"opponent": "", "venue": "", "outcome": "", "toss_result": "", "innings": ""}
     normal = side in ("A", "B")
     if normal:
-        cols = st.columns(3)
+        cols = st.columns(4)
         file_opp = labels["B" if side == "A" else "A"]
         suggested = closest_name(file_opp, known_opps)
         opts = list(dict.fromkeys([x for x in (suggested, file_opp) if x] + known_opps)) + [TYPE_OTHER]
@@ -166,8 +169,14 @@ def match_details(fk, mt, side, labels, known_opps, known_formats):
                                          index=OUTCOMES.index(g) if g else None, placeholder="Pick…")
         if g and d["outcome"] == g:
             cols[2].caption("From the scorecard")
+        gt = guess_toss(mt.get("toss"), mt["team_a"], mt["team_b"], side)
+        d["toss_result"] = cols[3].radio("Toss", list(TOSSES), horizontal=True, key=f"toss_{fk}_{side}",
+                                         index=TOSSES.index(gt) if gt else None,
+                                         format_func=lambda t: f"{t} toss")
+        if gt and d["toss_result"] == gt:
+            cols[3].caption("From the scorecard")
 
-    cols = st.columns(3)
+    cols = st.columns(4 if normal else 3)
     file_fmt = (mt.get("format") or "").strip()
     fmt_opts = list(dict.fromkeys(FORMAT_CHOICES + known_formats)) + [FMT_OTHER]
     fmt = cols[0].selectbox("Match format", fmt_opts, index=None, key=f"fmt_{fk}", placeholder="Pick…")
@@ -186,7 +195,13 @@ def match_details(fk, mt, side, labels, known_opps, known_formats):
     guess = guess_ball(file_fmt, d["overs"]) or guess_ball(d["format"], d["overs"])
     d["ball"] = cols[2].selectbox("Ball", list(BALLS), key=f"ball_{fk}_{short_hash(d['format'] + d['overs'])}",
                                   index=BALLS.index(guess) if guess else None, placeholder="Pick…")
-    need = (["opponent", "venue", "outcome"] if normal else []) + ["format", "overs", "ball"]
+    if normal:
+        gi = guess_innings(mt.get("result"), mt["team_a"], mt["team_b"], side, mt.get("bat_first", ""))
+        d["innings"] = cols[3].radio("Our innings", list(INNINGS), horizontal=True, key=f"inn_{fk}_{side}",
+                                     index=INNINGS.index(gi) if gi else None)
+        if gi and d["innings"] == gi:
+            cols[3].caption("From the scorecard")
+    need = (["opponent", "venue", "outcome", "toss_result", "innings"] if normal else []) + ["format", "overs", "ball"]
     d["missing"] = [k for k in need if not d.get(k)]
     return d
 
@@ -221,7 +236,7 @@ bowl_all["bowl_type"] = bowl_all["player"].map(types).fillna(NOT_SET)
 
 # ---------------- Sidebar: store status + filters ----------------
 PERIODS = ["All time", "Last 7 days", "Last 30 days", "Last 3 months", "This year", "Custom range"]
-FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_ball", "f_venue", "f_formats", "f_pos", "f_btype"]
+FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_ball", "f_venue", "f_inn", "f_formats", "f_pos", "f_btype"]
 
 
 def reset_filters():
@@ -292,6 +307,13 @@ with st.sidebar:
         st.session_state["f_venue"] = [v for v in st.session_state["f_venue"] if v in venue_opts]
     venue_sel = st.multiselect("Venue", venue_opts, key="f_venue", placeholder="Home and away")
 
+    # batting first / chasing
+    inn_opts = list(INNINGS) + ([NOT_SET] if (matches["innings_label"] == NOT_SET).any() else [])
+    if "f_inn" in st.session_state:
+        st.session_state["f_inn"] = [v for v in st.session_state["f_inn"] if v in inn_opts]
+    inn_sel = st.multiselect("Innings", inn_opts, key="f_inn", placeholder="Batting first and chasing",
+                             help="Our innings: matches where we batted first, or chased.")
+
     # match format
     formats = sorted(matches["format_label"].unique(), key=lambda f: (f == NO_FORMAT, f.lower()))
     if "f_formats" in st.session_state:
@@ -314,8 +336,9 @@ with st.sidebar:
     btype_sel = st.multiselect("Bowling type", btype_opts, key="f_btype", placeholder="Pace and spin",
                                help="Applies to bowling stats only.")
 
-    m_view = filter_rows(matches, date_range, include_undated, fmt_sel, balls=ball_sel, venues=venue_sel)
-    if date_range or ball_sel or venue_sel or fmt_sel or pos_sel or btype_sel:
+    m_view = filter_rows(matches, date_range, include_undated, fmt_sel, balls=ball_sel, venues=venue_sel,
+                         innings=inn_sel)
+    if date_range or ball_sel or venue_sel or inn_sel or fmt_sel or pos_sel or btype_sel:
         st.caption(f"Showing **{len(m_view)}** of {len(matches)} matches")
         st.button("↺  Reset filters", on_click=reset_filters)
 
@@ -337,11 +360,13 @@ with st.sidebar:
 
 # rows after filters (fielding isn't filtered by batting position: a catch has nothing
 # to do with where the catcher batted)
-bat_base = filter_rows(bat_all, date_range, include_undated, fmt_sel, balls=ball_sel, venues=venue_sel)
+common = dict(date_range=date_range, include_undated=include_undated, formats=fmt_sel, balls=ball_sel,
+              venues=venue_sel, innings=inn_sel)
+bat_base = filter_rows(bat_all, **common)
 bat_f = filter_rows(bat_base, positions=pos_sel)
-bowl_f = filter_rows(bowl_all, date_range, include_undated, fmt_sel, bowl_types=btype_sel, balls=ball_sel,
-                     venues=venue_sel)
-field_f = filter_rows(field_all, date_range, include_undated, fmt_sel, balls=ball_sel, venues=venue_sel)
+bowl_base = filter_rows(bowl_all, **common)
+bowl_f = filter_rows(bowl_base, bowl_types=btype_sel)
+field_f = filter_rows(field_all, **common)
 
 note_parts = []
 if date_range:
@@ -350,6 +375,8 @@ if ball_sel:
     note_parts.append(" & ".join(ball_sel))
 if venue_sel:
     note_parts.append(" & ".join(venue_sel) + (" games" if NOT_SET not in venue_sel else ""))
+if inn_sel:
+    note_parts.append(" & ".join(inn_sel))
 if fmt_sel:
     note_parts.append(", ".join(fmt_sel))
 if pos_sel:
@@ -358,6 +385,66 @@ if btype_sel:
     note_parts.append(" & ".join(btype_sel) + " bowlers")
 FILTER_NOTE = ("Filtered: " + " · ".join(note_parts)) if note_parts else ""
 unknown_pos = int(bat_base["position"].isna().sum()) if pos_sel else 0
+
+
+@st.cache_data(show_spinner=False)
+def points_for(bat, bowl, field):
+    return match_points(bat, bowl, field)
+
+
+def mvp_points():
+    """MVP counts every innings: the batting-position and bowling-type filters are for the
+    batting and bowling tables only."""
+    return points_for(bat_base, bowl_base, field_f)
+
+
+@st.cache_data(show_spinner=False)
+def card_png(card_json):
+    import json
+    return ui.share_card_png(json.loads(card_json))
+
+
+def build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts):
+    """Numbers for the shareable PNG card, using the same filters as the page."""
+    table = mvp_table(mp)
+    potm = int(players_of_match(mp)["player"].eq(name).sum()) if not mp.empty else 0
+    mvp_line = ""
+    if name in set(table["Player"]):
+        row = table[table["Player"] == name].iloc[0]
+        rank = int(table.index[table["Player"] == name][0]) + 1
+        mvp_line = f"MVP {int(row['Total'])} pts · Rank {rank} of {len(table)}"
+    fd = field_f.loc[field_f["player"] == name, "dismissal"]
+    catches = int(fd.isin(["caught", "caught & bowled"]).sum())
+    more = None
+    if not pb.empty:
+        b = career_batting(pb).iloc[0]
+        top = pb.sort_values(["runs", "balls"], ascending=[False, True])
+        top = top.assign(_no=top["how_out"] == "not out").sort_values(["runs", "_no"], ascending=False).iloc[0]
+        bat = ("BATTING", [("Runs", int(b["Runs"])), ("Innings", int(b["Inns"])),
+                           ("Highest", f"{int(top['runs'])}{'*' if top['how_out'] == 'not out' else ''}"),
+                           ("Average", dash(b["Avg"]) if pd.isna(b["Avg"]) else f"{b['Avg']:.2f}"),
+                           ("Strike rate", dash(b["SR"]) if pd.isna(b["SR"]) else f"{b['SR']:.2f}"),
+                           ("50s / 100s", f"{int(b['50s'])} / {int(b['100s'])}")])
+        more = ("MORE", [("Fours", int(pb["fours"].sum())), ("Sixes", int(pb["sixes"].sum())),
+                         ("Not outs", int((pb["how_out"] == "not out").sum())), ("Catches", catches),
+                         ("Player of Match", potm), ("Matches", n_matches)])
+    if not pw.empty:
+        w = career_bowling(pw).iloc[0]
+        bowl = ("BOWLING", [("Wickets", int(w["Wkts"])), ("Best", w["Best"]),
+                            ("Average", "—" if pd.isna(w["Avg"]) else f"{w['Avg']:.2f}"),
+                            ("Economy", "—" if pd.isna(w["Econ"]) else f"{w['Econ']:.2f}"),
+                            ("Overs", f"{w['Overs']:g}"), ("Type", w.get("Type", "—"))])
+        if more is None:
+            more = ("MORE", [("Maidens", int(w["Mdns"])), ("3W+", int(w["3W+"])), ("Catches", catches),
+                             ("Player of Match", potm), ("Matches", n_matches), ("Innings", int(w["Inns"]))])
+    sections = [s_ for s_ in ((bat if not pb.empty else more), (bowl if not pw.empty else more))]
+    extra = " · ".join(x for x in [f"Fielding: {catches} catch{'es' if catches != 1 else ''}",
+                                   f"Player of the Match {potm}×" if potm else ""] if x)
+    fmt_txt = fmts[0] if len(fmts) == 1 else (f"{len(fmts)} formats" if fmts else "")
+    return {"name": name, "line": " · ".join(x for x in [", ".join(teams), f"{n_matches} match(es)", fmt_txt] if x),
+            "mvp": mvp_line, "sections": sections, "extra": extra,
+            "scope": FILTER_NOTE or f"All matches from {ui.STATS_FROM}",
+            "footer_right": f"As of {dt.date.today():%d %b %Y}"}
 
 
 def show_filter_note(batting=True):
@@ -369,10 +456,119 @@ def show_filter_note(batting=True):
 
 
 ui.masthead(len(matches), len(players), matches["date_dt"].max() if not matches.empty else None)
-TAB_LABELS = {"top": "🏆  Top performers", "team": "📈  Team analysis", "board": "📊  Leaderboards",
-              "search": "🔎  Player search"}
+# ---------------- Data health (admin) ----------------
+def data_health():
+    """Every check returns (title, kind, where_to_fix, rows). kind: 'fix' (wrong or missing)
+    or 'check' (worth a look). rows is a DataFrame; empty means the check passed."""
+    checks = []
+    date_col = lambda df: fmt_date(df["date_dt"])
+    normal = matches[matches["our_side"].isin(["A", "B"])]
+    need = {"opponent_label": "opponent", "venue_label": "venue", "outcome_label": "result",
+            "toss_label": "toss", "innings_label": "innings", "format_label": "format", "ball_label": "ball"}
+    miss = []
+    for _, r in matches.iterrows():
+        keys = need if r["our_side"] in ("A", "B") else {"format_label": "format", "ball_label": "ball"}
+        gaps = [lbl for col, lbl in keys.items() if r[col] in (NOT_SET, NO_FORMAT, "")]
+        if pd.isna(pd.to_numeric(r.get("overs"), errors="coerce")):
+            gaps.append("overs")
+        if gaps:
+            miss.append({"Date": r["date_dt"], "Match": f"{r['team_a']} vs {r['team_b']}",
+                         "Missing": ", ".join(gaps), "ID": r["match_id"]})
+    miss = pd.DataFrame(miss, columns=["Date", "Match", "Missing", "ID"])
+    if not miss.empty:
+        miss["Date"] = fmt_date(miss["Date"])
+    checks.append(("Matches with missing details", "fix", "📋 Matches tab — edit the cells and Save", miss))
+
+    std = set(FORMAT_CHOICES)
+    odd = matches[~matches["format_label"].isin(std) & (matches["format_label"] != NO_FORMAT)]
+    odd = (odd.groupby("format_label").size().reset_index(name="Matches")
+              .rename(columns={"format_label": "Format"}))
+    checks.append(("Formats not from your standard list", "check",
+                   "📋 Matches tab — pick a format from the list (fine to keep if it's one you typed on purpose)", odd))
+
+    start = pd.to_datetime(ui.STATS_FROM, dayfirst=True, errors="coerce")
+    early = matches[(matches["date_dt"] < start) | matches["date_dt"].isna()]
+    early = pd.DataFrame({"Date": date_col(early), "Match": early["team_a"] + " vs " + early["team_b"],
+                          "Problem": np.where(early["date_dt"].isna(), "no date",
+                                              f"before {ui.STATS_FROM}"), "ID": early["match_id"]})
+    checks.append((f"Matches dated before {ui.STATS_FROM} or with no date", "check",
+                   "🛠 Manage → Delete a match, if it shouldn't be here", early))
+
+    b = bat_all
+    bad_bat = []
+    for _, r in b.iterrows():
+        runs, balls, fours, sixes = int(r["runs"]), int(r["balls"]), int(r["fours"]), int(r["sixes"])
+        why = []
+        if runs > 0 and balls == 0:
+            why.append("runs with 0 balls")
+        if fours * 4 + sixes * 6 > runs:
+            why.append("more boundary runs than runs")
+        if balls and runs > balls * 6:
+            why.append("more than 6 runs a ball")
+        if why:
+            bad_bat.append({"Date": r["date_dt"], "Player": r["player"], "R": runs, "B": balls,
+                            "4s": fours, "6s": sixes, "Problem": ", ".join(why), "ID": r["match_id"]})
+    bad_bat = pd.DataFrame(bad_bat, columns=["Date", "Player", "R", "B", "4s", "6s", "Problem", "ID"])
+    if not bad_bat.empty:
+        bad_bat["Date"] = fmt_date(bad_bat["Date"])
+    checks.append(("Batting numbers that can't be right", "fix",
+                   "Re-upload the match (Add matches → Replace the saved copy)", bad_bat))
+
+    bad_bowl = []
+    for _, r in bowl_all.iterrows():
+        o = float(r["overs"] or 0)
+        why = []
+        if round((o - int(o)) * 10) > 5:
+            why.append(f"overs {o:g} (balls part above 5)")
+        if int(r["wickets"]) > 10:
+            why.append("more than 10 wickets")
+        if int(r["maidens"]) > int(o):
+            why.append("more maidens than overs")
+        if o == 0 and int(r["runs"]) > 0:
+            why.append("no overs recorded (screenshot upload)")
+        if why:
+            bad_bowl.append({"Date": r["date_dt"], "Player": r["player"], "O": o, "M": int(r["maidens"]),
+                             "R": int(r["runs"]), "W": int(r["wickets"]), "Problem": ", ".join(why),
+                             "ID": r["match_id"]})
+    bad_bowl = pd.DataFrame(bad_bowl, columns=["Date", "Player", "O", "M", "R", "W", "Problem", "ID"])
+    if not bad_bowl.empty:
+        bad_bowl["Date"] = fmt_date(bad_bowl["Date"])
+    checks.append(("Bowling numbers to check", "fix",
+                   "Re-upload the match from its PDF (Add matches → Replace the saved copy)", bad_bowl))
+
+    untyped = sorted(set(bowl_all["player"]) - set(types))
+    checks.append(("Bowlers without pace or spin", "fix", "🛠 Manage → Bowling types",
+                   pd.DataFrame({"Bowler": untyped})))
+
+    ignored = tuple(sorted(tuple(sorted(p)) for p in db.ignored_pairs()))
+    groups = name_groups(tuple(players), ignored, 0.85) if len(players) > 1 else []
+    checks.append(("Player names that look alike", "check", "🛠 Manage → Similar names",
+                   pd.DataFrame({"Possibly the same player": [", ".join(g) for g in groups]})))
+
+    dups = dup_pairs(matches, bat_all, tuple(sorted(tuple(sorted(p)) for p in db.dup_ignored()))) \
+        if len(matches) > 1 else []
+    checks.append(("Possible duplicate matches", "fix", "🛠 Manage → Duplicate matches",
+                   pd.DataFrame({"Match": [f"{d['a']['team_a']} vs {d['a']['team_b']} — IDs "
+                                           f"{d['a']['match_id']} & {d['b']['match_id']}" for d in dups]})))
+
+    opp_groups = name_clusters(sorted({o for o in normal["opponent_label"] if o}))
+    checks.append(("Opposition names that look alike", "check", "🛠 Manage → Opposition names",
+                   pd.DataFrame({"Possibly the same team": [", ".join(g) for g in opp_groups]})))
+
+    others = [t for t in sorted(set(bat_all["team"]) | set(bowl_all["team"])) if not team_matches(t, our_names)]
+    checks.append(("Other teams' player stats still saved", "fix", "🛠 Manage → Remove other teams' stats",
+                   pd.DataFrame({"Team": others})))
+    return checks
+
+
+HEALTH = data_health() if IS_ADMIN else []
+n_issues = sum(1 for c in HEALTH if not c[3].empty)
+
+TAB_LABELS = {"top": "🏆  Top performers", "mvp": "🏅  MVP", "team": "📈  Team analysis",
+              "board": "📊  Leaderboards", "search": "🔎  Player search"}
 if IS_ADMIN:
-    TAB_LABELS.update({"add": "➕  Add matches", "matches": "📋  Matches", "manage": "🛠  Manage"})
+    TAB_LABELS.update({"add": "➕  Add matches", "matches": "📋  Matches", "manage": "🛠  Manage",
+                       "health": f"🩺  Data health ({n_issues})" if n_issues else "🩺  Data health ✓"})
 TABS = dict(zip(TAB_LABELS, st.tabs(list(TAB_LABELS.values()))))
 
 # ---------------- Add matches ----------------
@@ -526,15 +722,16 @@ if IS_ADMIN:
             for c, _, side, d in live:
                 if side in ("A", "B", "AB"):
                     c["p"]["meta"].update({k: d.get(k, "") for k in
-                                           ("ball", "venue", "opponent", "outcome", "format", "overs")})
+                                           ("ball", "venue", "opponent", "outcome", "format", "overs",
+                                            "toss_result", "innings")})
                     to_save.append((c["p"], set(side)))
             to_replace = sorted({str(c["saved"]["match_id"]) for c, action, side, _d in live
                                  if action == "replace" and side in ("A", "B", "AB")})
             if pending:
                 st.warning(f"Pick your side for {pending} match(es) — or choose “Skip this match”.")
             if no_ball:
-                st.warning(f"Fill in the match details (opponent, venue, result, format, overs, ball) for "
-                           f"{no_ball} match(es).")
+                st.warning(f"Fill in the match details (opponent, venue, result, toss, innings, format, overs, "
+                           f"ball) for {no_ball} match(es).")
 
             # ---- your bowlers with no bowling type yet: ask once per player, pace or spin
             new_bowlers = sorted({r["player"] for p, sides in to_save for r in db.rows_for(p, sides)[2]
@@ -605,6 +802,10 @@ if IS_ADMIN:
             m_outcome = mc7.selectbox("Result for us", list(OUTCOMES), index=None, key="m_outcome",
                                       placeholder="Pick…")
             m_ball = mc8.radio("Ball", list(BALLS), index=None, horizontal=True, key="m_ball")
+            mc9, mc10, _ = st.columns(3)
+            m_toss = mc9.radio("Toss", list(TOSSES), index=None, horizontal=True, key="m_toss",
+                               format_func=lambda t: f"{t} toss")
+            m_inn = mc10.radio("Our innings", list(INNINGS), index=None, horizontal=True, key="m_inn")
 
             st.markdown("**Your batting** (one row per batter, in batting order)")
             bat_tmpl = pd.DataFrame([{"player": "", "runs": 0, "balls": 0, "fours": 0, "sixes": 0,
@@ -626,6 +827,7 @@ if IS_ADMIN:
                               "overs": str(int(m_overs)) if m_overs else "", "result": res, "toss": "",
                               "team_a": team,
                               "ball": m_ball or "", "venue": m_venue or "", "outcome": m_outcome or "",
+                              "toss_result": m_toss or "", "innings": m_inn or "",
                               "opponent": tb.strip(),
                               "team_b": tb.strip(), "score_a": sa, "score_b": sb}, "batting": [], "bowling": []}
                 for _, r in bat_edit.iterrows():
@@ -653,8 +855,8 @@ if IS_ADMIN:
                            if b["player"] not in types and b["player"] not in typed_types]
                 if not (p["batting"] or p["bowling"]):
                     st.warning("Add at least one batter or bowler before saving.")
-                elif not (tb.strip() and m_venue and m_outcome and m_format and m_overs):
-                    st.warning("Fill in the opponent, venue, result, match format and overs.")
+                elif not (tb.strip() and m_venue and m_outcome and m_format and m_overs and m_toss and m_inn):
+                    st.warning("Fill in the opponent, venue, result, toss, innings, match format and overs.")
                 elif not m_ball:
                     st.warning("Pick white ball or red ball.")
                 elif no_type:
@@ -677,6 +879,21 @@ def render_profile(name, bat_f, field_f, bowl_f):
     st.markdown(f"### {name}")
     ui.chips(teams + [f"{n_matches} match(es)"] + fmts)
 
+    if pb.empty and pw.empty:
+        st.info("No innings for this player in the current filters — change the sidebar filters.")
+        return
+    with st.expander("📸  Player card — download and share"):
+        import json
+        mp = mvp_points()
+        png = card_png(json.dumps(build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts), default=str))
+        c1, c2 = st.columns([2, 3])
+        c1.image(png, width="stretch")
+        c2.markdown("A ready-made image of this player's stats for WhatsApp or Instagram. "
+                    "It uses the filters you've picked in the sidebar.")
+        c2.download_button("⬇️  Download card (PNG)", png, key=f"dl_{short_hash(name)}",
+                           file_name=f"UOL-QHPC-{'-'.join(name.split())}.png", mime="image/png",
+                           type="primary")
+
     view = st.radio("Show", ["Batting", "Bowling"], horizontal=True, key=f"pv_{short_hash(name)}",
                     label_visibility="collapsed")
     if view == "Batting":
@@ -695,6 +912,21 @@ def render_profile(name, bat_f, field_f, bowl_f):
                     ("caught", "catch", "catches"), ("caught & bowled", "caught & bowled", "caught & bowled"),
                     ("stumped", "stumping", "stumpings"), ("run out", "run-out", "run-outs")]
                 if fd.get(k, 0)))
+        how, not_outs, outs = dismissal_breakdown(pb)
+        st.markdown("**How he got out**")
+        if outs:
+            top_how = how.iloc[0]
+            st.caption(f"Out {outs} time(s) in {len(pb)} innings"
+                       + (f", not out {not_outs}" if not_outs else "")
+                       + f" — most often {top_how['How out'].lower()} ({int(top_how['Times'])}, "
+                         f"{top_how['% of dismissals']:.0f}%).")
+            hl, hr = st.columns([2, 3])
+            hl.dataframe(ui.styled(how.assign(**{"% of dismissals": how["% of dismissals"].astype(int).astype(str) + "%"})),
+                         hide_index=True, width="stretch")
+            hr.bar_chart(how.set_index("How out")[["Times"]], horizontal=True, height=max(140, 42 * len(how)),
+                         x_label="", y_label="Times")
+        else:
+            st.caption(f"Not out in all {len(pb)} innings so far.")
         left, right = st.columns([2, 3])
         with left:
             st.markdown("**By batting position**")
@@ -712,7 +944,9 @@ def render_profile(name, bat_f, field_f, bowl_f):
         mbm = pb.sort_values("date_dt", ascending=False, na_position="last")
         st.dataframe(ui.styled(pd.DataFrame({
             "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
-            "Format": mbm["format_label"], "Pos": mbm["position"], "How out": mbm["how_out"], "R": mbm["runs"], "B": mbm["balls"],
+            "Format": mbm["format_label"], "Pos": mbm["position"],
+            "How out": mbm["how_out"].map(lambda h: "Not out" if h == "not out" else HOW_OUT_LABELS.get(h, "—")),
+            "R": mbm["runs"], "B": mbm["balls"],
             "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]})),
             hide_index=True, width="stretch")
     else:
@@ -913,6 +1147,57 @@ with TABS["top"]:
     top_performers(bat_f, bowl_f)
 
 
+# ---------------- MVP ----------------
+@st.fragment
+def mvp_tab(bat_f, bowl_f, field_f):
+    show_filter_note(batting=False)
+    mp = mvp_points()
+    table = mvp_table(mp)
+    if table.empty:
+        st.info("No matches yet — check back soon.")
+        return
+    potm = players_of_match(mp)
+    top, best = table.iloc[0], mp.sort_values("total", ascending=False).iloc[0]
+    most_potm = table.sort_values(["POTM", "Total"], ascending=False).iloc[0]
+    ui.cards([
+        ("MVP", int(top["Total"]), f"{top['Player']} · {top['Matches']} match(es)"),
+        ("Most Player of the Match", int(most_potm["POTM"]), most_potm["Player"] if most_potm["POTM"] else ""),
+        ("Best single match", int(best["total"]),
+         f"{best['player']}" + (f" vs {best['opponent']}" if best["opponent"] else "")),
+        ("Players with points", len(table), f"{mp['match_id'].nunique()} match(es)"),
+    ])
+    c1, c2 = st.columns([1, 2])
+    min_m = c1.number_input("Min. matches", min_value=1, value=1, step=1, key="mvp_min")
+    q = c2.text_input("Find player", key="mvp_q", placeholder="Filter the table by name")
+    t = table[table["Matches"] >= min_m]
+    if q.strip():
+        t = t[t["Player"].str.contains(q.strip(), case=False, regex=False)]
+    t = t.reset_index(drop=True)
+    t.insert(0, "#", range(1, len(t) + 1))
+    st.dataframe(ui.styled(t, top=0 if q.strip() else 3), hide_index=True, width="stretch",
+                 height=min(38 + 35 * len(t), 640),
+                 column_config={"#": st.column_config.NumberColumn("#", width="small"),
+                                "POTM": st.column_config.NumberColumn("POTM", help="Player of the Match awards"),
+                                "Best": st.column_config.NumberColumn("Best", help="Most points in one match")})
+    with st.expander("How points work"):
+        for group, rules in POINTS_RULES:
+            st.markdown(f"**{group}**")
+            st.dataframe(pd.DataFrame(rules, columns=["", "Points"]), hide_index=True, width="stretch")
+        st.caption("Player of the Match = most points in that match. The sidebar filters apply "
+                   "(except batting position and bowling type), so you can see the MVP for a format, "
+                   "a ball type, home or away, or a date range.")
+
+    ui.section("01", "Player of the Match")
+    st.dataframe(ui.styled(pd.DataFrame({
+        "Date": fmt_date(potm["date_dt"]), "Opponent": potm["opponent"].replace("", "—"),
+        "Player": potm["player"], "Performance": potm["performance"], "Points": potm["total"]})),
+        hide_index=True, width="stretch")
+
+
+with TABS["mvp"]:
+    mvp_tab(bat_f, bowl_f, field_f)
+
+
 # ---------------- Team analysis ----------------
 @st.fragment
 def team_analysis(m):
@@ -946,22 +1231,45 @@ def team_analysis(m):
     st.dataframe(ui.styled(record_table(games, "opponent_label", "Opponent"), result_col="Last result"),
                  hide_index=True, width="stretch")
 
-    ui.section("02", "Home and away · white and red ball")
+    ui.section("02", "Toss · batting first vs chasing")
+    known_inn = games[games["innings_label"] != NOT_SET]
+    bf, ch = (team_record(known_inn[known_inn["innings_label"] == k]) for k in INNINGS)
+    tw = team_record(games[games["toss_label"] == "Won"])
+    fmt_pct = lambda r: f"{r['Win %']:.0f}%" if r["Win %"] is not None else "—"
+    ui.cards([
+        ("Win % batting first", fmt_pct(bf), f"{bf['Won']} won of {bf['Played']}"),
+        ("Win % chasing", fmt_pct(ch), f"{ch['Won']} won of {ch['Played']}"),
+        ("Win % after winning toss", fmt_pct(tw), f"{tw['Won']} won of {tw['Played']}"),
+        ("Tosses won", f"{int((games['toss_label'] == 'Won').sum())} of "
+                       f"{int(games['toss_label'].isin(TOSSES).sum())}", ""),
+    ])
+    c1, c2 = st.columns(2, gap="medium")
+    c1.dataframe(ui.styled(record_table(games, "innings_label", "Our innings").drop(columns=["Last result"])),
+                 hide_index=True, width="stretch")
+    c2.dataframe(ui.styled(record_table(games, "toss_label", "Toss").drop(columns=["Last result"])),
+                 hide_index=True, width="stretch")
+    st.dataframe(ui.styled(record_table(games, "toss_innings", "Toss and decision").drop(columns=["Last result"])),
+                 hide_index=True, width="stretch")
+    unknown = int(((games["toss_label"] == NOT_SET) | (games["innings_label"] == NOT_SET)).sum())
+    if unknown:
+        st.caption(f"{unknown} match(es) have no toss or innings recorded — set them in the 📋 Matches tab.")
+
+    ui.section("03", "Home and away · white and red ball")
     c1, c2 = st.columns(2, gap="medium")
     c1.dataframe(ui.styled(record_table(games, "venue_label", "Venue").drop(columns=["Last result"])),
                  hide_index=True, width="stretch")
     c2.dataframe(ui.styled(record_table(games, "ball_label", "Ball").drop(columns=["Last result"])),
                  hide_index=True, width="stretch")
 
-    ui.section("03", "By match format")
+    ui.section("04", "By match format")
     st.dataframe(ui.styled(record_table(games, "format_label", "Format").drop(columns=["Last result"])),
                  hide_index=True, width="stretch")
 
-    ui.section("04", "All results")
+    ui.section("05", "All results")
     allr = games.sort_values("date_dt", ascending=False, na_position="last")
     st.dataframe(ui.styled(pd.DataFrame({
         "Date": fmt_date(allr["date_dt"]), "Opponent": allr["opponent_label"], "Venue": allr["venue_label"],
-        "Format": allr["format_label"], "Ball": allr["ball_label"], "Us": allr["our_score"],
+        "Toss": allr["toss_label"], "Innings": allr["innings_label"], "Format": allr["format_label"], "Ball": allr["ball_label"], "Us": allr["our_score"],
         "Them": allr["opp_score"], "Result": allr["outcome_label"], "Margin": allr["result"]}),
         result_col="Result"), hide_index=True, width="stretch")
 
@@ -989,23 +1297,26 @@ if IS_ADMIN:
                 "Opponent": [o if n else INTRA for o, n in zip(mv["opponent_label"], normal)],
                 "Venue": [v if v in VENUES else None for v in mv["venue_label"]],
                 "Result": [o if o in OUTCOMES else None for o in mv["outcome_label"]],
+                "Toss": [t if t in TOSSES else None for t in mv["toss_label"]],
+                "Innings": [i if i in INNINGS else None for i in mv["innings_label"]],
                 "Format": [f or None for f in mv["format"]],
                 "Overs": pd.to_numeric(mv["overs"], errors="coerce"),
                 "Ball": [b if b in BALLS else None for b in mv["ball_label"]],
                 "Us": mv["our_score"], "Them": mv["opp_score"], "Scorecard result": mv["result"],
             }).reset_index(drop=True)
             ids = mv["match_id"].tolist()
-            st.caption("Opponent, venue, result, format and ball can be corrected here: edit the cells, "
-                       "then press Save.")
-            edit_cols = {"Opponent": "opponent", "Venue": "venue", "Result": "outcome", "Format": "format",
-                         "Overs": "overs",
-                         "Ball": "ball"}
+            st.caption("Opponent, venue, result, toss, innings, format, overs and ball can be corrected here: "
+                       "edit the cells, then press Save.")
+            edit_cols = {"Opponent": "opponent", "Venue": "venue", "Result": "outcome", "Toss": "toss_result",
+                         "Innings": "innings", "Format": "format", "Overs": "overs", "Ball": "ball"}
             edited = st.data_editor(
                 table, hide_index=True, width="stretch", key=f"m_ed_{short_hash('|'.join(ids))}",
                 disabled=[c for c in table.columns if c not in edit_cols],
                 column_config={
                     "Venue": st.column_config.SelectboxColumn("Venue", options=list(VENUES)),
                     "Result": st.column_config.SelectboxColumn("Result", options=list(OUTCOMES)),
+                    "Toss": st.column_config.SelectboxColumn("Toss", options=list(TOSSES)),
+                    "Innings": st.column_config.SelectboxColumn("Innings", options=list(INNINGS)),
                     "Format": st.column_config.SelectboxColumn(
                         "Format", options=list(dict.fromkeys(FORMAT_CHOICES + known_formats))),
                     "Overs": st.column_config.NumberColumn("Overs", min_value=1, max_value=200, step=1),
@@ -1014,7 +1325,7 @@ if IS_ADMIN:
             for i, mid in enumerate(ids):
                 for col, field in edit_cols.items():
                     old, new = table.at[i, col], edited.at[i, col]
-                    if col == "Opponent" and (not normal[i] or not str(new or "").strip()):
+                    if col in ("Opponent", "Toss", "Innings") and (not normal[i] or not str(new or "").strip()):
                         continue
                     if pd.notna(new) and not (pd.notna(old) and new == old) and str(new).strip():
                         changes.setdefault(mid, {})[field] = (str(int(new)) if col == "Overs"
@@ -1337,6 +1648,27 @@ if IS_ADMIN:
                     n = db.keep_only_teams(keep_sel)
                     st.session_state["keepteams_done"] = f"Removed {n} rows from {len(remove)} other team(s)."
                     st.rerun()
+
+
+# ---------------- Data health ----------------
+if IS_ADMIN:
+    with TABS["health"]:
+        n_fix = sum(1 for t, k, w, rows in HEALTH if k == "fix" and not rows.empty)
+        n_check = sum(1 for t, k, w, rows in HEALTH if k == "check" and not rows.empty)
+        ui.cards([("To fix", n_fix, "wrong or missing data"), ("To check", n_check, "worth a quick look"),
+                  ("All clear", len(HEALTH) - n_fix - n_check, f"of {len(HEALTH)} checks")])
+        st.caption("Checks run on all saved data (the sidebar filters don't apply here). "
+                   "Fix things where each card says, then come back — the count updates by itself.")
+        order = sorted(HEALTH, key=lambda c: (c[3].empty, c[1] != "fix"))
+        for title, kind, where, rows in order:
+            if rows.empty:
+                st.markdown(f"✅ &nbsp;{title}")
+                continue
+            icon = "🔴" if kind == "fix" else "🟡"
+            with st.expander(f"{icon}  {title} ({len(rows)})", expanded=kind == "fix"):
+                st.caption(f"Where to fix: {where}")
+                st.dataframe(ui.styled(rows), hide_index=True, width="stretch",
+                             height=min(38 + 35 * len(rows), 360))
 
 
 ui.footer(matches["date_dt"].max() if not matches.empty else None)
