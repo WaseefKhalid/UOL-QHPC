@@ -19,19 +19,23 @@ COLUMNS = {
                 "team_b", "score_b", "result", "format", "overs", "toss", "ball",
                 "venue", "opponent", "outcome", "toss_result", "innings"],
     "batting": ["match_id", "date", "type", "team", "is_ours", "player", "how_out",
-                "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos"],
+                "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos", "scorecard_name"],
     "bowling": ["match_id", "date", "type", "team", "is_ours", "player", "overs",
                 "maidens", "runs", "wickets", "econ", "dots", "fours_conceded",
-                "sixes_conceded", "wides", "no_balls"],
+                "sixes_conceded", "wides", "no_balls", "scorecard_name"],
     # your players' catches / stumpings / run-outs (they sit in the opposition's batting
     # scorecard, which isn't saved)
-    "fielding": ["match_id", "date", "type", "team", "player", "dismissal"],
+    "fielding": ["match_id", "date", "type", "team", "player", "dismissal", "scorecard_name"],
     # name pairs you marked "not the same player", so they stop being suggested
     "name_ignores": ["name_a", "name_b"],
     # match pairs you checked and marked "not duplicates"
     "dup_ignores": ["match_a", "match_b"],
     # one row per player: things that don't change match to match (bowling type)
     "players": ["player", "bowling_type"],
+    # your squad list — add new admissions here (one full name per row)
+    "squad": ["Full name"],
+    # scorecard spellings you've confirmed: "Hasnian" -> "Muhammad Hasnain Ali"
+    "spellings": ["Scorecard name", "Full name", "In squad"],
 }
 BOWLING_TYPES = ("Pace", "Spin")
 STAT_TABS = ("matches", "batting", "bowling", "fielding")
@@ -45,6 +49,8 @@ NUMERIC = {
     "name_ignores": [],
     "dup_ignores": [],
     "players": [],
+    "squad": [],
+    "spellings": [],
 }
 
 
@@ -332,11 +338,16 @@ def rows_for(parsed, sides):
     return match_row, bat, bowl, field
 
 
-def append_many(items):
-    """items: list of (parsed, sides). Saves every match in 4 write calls total (one per tab)."""
+def append_many(items, names=None):
+    """items: list of (parsed, sides). names: {scorecard name: full name} from the squad list.
+    Saves every match in 4 write calls total (one per tab)."""
+    names = names or {}
     all_m, all_b, all_w, all_f = [], [], [], []
     for parsed, sides in items:
         m, b, w, f = rows_for(parsed, sides)
+        for row in b + w + f:
+            row["scorecard_name"] = row["player"]
+            row["player"] = names.get(row["player"], row["player"])
         all_m.append(m)
         all_b += b
         all_w += w
@@ -349,8 +360,8 @@ def append_many(items):
     return len(all_b), len(all_w)
 
 
-def append_match(parsed, sides):
-    return append_many([(parsed, sides)])
+def append_match(parsed, sides, names=None):
+    return append_many([(parsed, sides)], names)
 
 
 def delete_match(match_id):
@@ -474,6 +485,67 @@ def remove_ignored_pairs(pairs):
     keep = [frozenset((str(a), str(b))) not in drop
             for a, b in zip(df["name_a"].fillna(""), df["name_b"].fillna(""))]
     _overwrite("name_ignores", df[keep])
+
+
+# ---------------- squad list + remembered spellings ----------------
+_HEADER_WORDS = {"name", "names", "full name", "player", "player name", "players"}
+
+
+def squad_names():
+    """Full names from the squad tab, in the order typed (blank rows and repeats dropped)."""
+    df = load("squad")
+    out = []
+    for n in df["Full name"].fillna("").astype(str):
+        n = " ".join(n.split())
+        if n and n.lower() not in _HEADER_WORDS and n not in out:
+            out.append(n)
+    return out
+
+
+def squad_duplicates():
+    names = [" ".join(str(n).split()) for n in load("squad")["Full name"].fillna("") if str(n).strip()]
+    seen, dup = set(), []
+    for n in names:
+        k = n.lower()
+        if k in seen and n not in dup:
+            dup.append(n)
+        seen.add(k)
+    return dup
+
+
+def spellings():
+    """{scorecard name (lower-case, marks removed): (full name, in squad?)}"""
+    from stats import name_key
+    df = load("spellings")
+    out = {}
+    for raw, full, ins in zip(df["Scorecard name"].fillna(""), df["Full name"].fillna(""), df["In squad"].fillna("")):
+        raw, full = str(raw).strip(), " ".join(str(full).split())
+        if raw and full:
+            out[name_key(raw)] = (full, str(ins).strip().lower() not in ("no", "n", "false", "0"))
+    return out
+
+
+def save_spellings(updates):
+    """updates: {scorecard name: (full name, in squad?)} — added or replaced in the spellings tab."""
+    from stats import name_key
+    if not updates:
+        return
+    df = load("spellings")
+    keys = df["Scorecard name"].fillna("").astype(str).map(name_key)
+    drop = keys.isin({name_key(r) for r in updates})
+    new = pd.DataFrame([{"Scorecard name": r, "Full name": f, "In squad": "Yes" if ins else "No"}
+                        for r, (f, ins) in updates.items()], columns=COLUMNS["spellings"])
+    out = pd.concat([df[~drop], new], ignore_index=True)
+    _overwrite("spellings", out)
+
+
+def relink_names(pairs, remember=None):
+    """Rename saved players to their squad-list full names: {saved name: full name}."""
+    for raw, full in pairs.items():
+        if raw != full:
+            rename_player([raw, full], full)
+    save_spellings(remember or {})
+    clear_cache()
 
 
 # ---------------- bowling type (pace / spin), stored once per player ----------------
