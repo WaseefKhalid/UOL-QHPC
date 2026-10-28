@@ -42,7 +42,7 @@ def backend_label():
 
 # ---------------- Google Sheets backend (cached + rate-limit safe) ----------------
 def _retry(fn, *args, **kwargs):
-    """Call a gspread function, backing off and retrying if Google returns a rate limit (429)."""
+    """Call a gspread function, backing off and retrying on rate limits (429) and brief Google outages (5xx)."""
     import gspread
     last = None
     for i in range(6):
@@ -55,12 +55,22 @@ def _retry(fn, *args, **kwargs):
                 status = e.response.status_code
             except Exception:
                 pass
-            if status == 429:
+            if status in (429, 500, 502, 503):
                 time.sleep(2 * (i + 1))
                 continue
             raise
     if last:
         raise last
+
+
+def _norm(header):
+    return str(header).strip().lower()
+
+
+def _col(n):
+    """Column number -> letter: 1 -> 'A', 14 -> 'N', 27 -> 'AA'."""
+    import gspread
+    return gspread.utils.rowcol_to_a1(1, n)[:-1]
 
 
 @st.cache_resource(show_spinner=False)
@@ -77,7 +87,7 @@ def _ensure_tabs():
     for name in COLUMNS:
         if name not in titles:
             ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(COLUMNS[name]))
-            _retry(ws.update, [COLUMNS[name]])
+            _retry(ws.update, [COLUMNS[name]], "A1")
     return True
 
 
@@ -89,9 +99,36 @@ def _ws(name):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _sheets_load(name):
-    ws = _ws(name)
-    records = _retry(ws.get_all_records)
-    return pd.DataFrame(records, columns=COLUMNS[name]) if records else pd.DataFrame(columns=COLUMNS[name])
+    """Read a tab by column *name*, so blank, duplicate, extra or reordered columns
+    in the sheet can't break the load (gspread's get_all_records crashes on them)."""
+    import gspread
+    cols = COLUMNS[name]
+    grid = _retry(_ws(name).get_all_values)
+    rows = [r for r in grid if any(str(c).strip() for c in r)]  # skip fully blank rows
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    pos = {}
+    for i, h in enumerate(rows[0]):
+        key = _norm(h)
+        if key and key not in pos:  # first occurrence wins if a name repeats
+            pos[key] = i
+    idx = [pos.get(_norm(c)) for c in cols]
+
+    if any(i is not None for i in idx):
+        body = rows[1:]
+    else:
+        # No recognisable header row (it was wiped): rows are written in COLUMNS order,
+        # so read them by position instead of losing the data.
+        idx, body = list(range(len(cols))), rows
+
+    records = [
+        gspread.utils.numericise_all(
+            [r[i] if i is not None and i < len(r) else "" for i in idx]
+        )
+        for r in body
+    ]
+    return pd.DataFrame(records, columns=cols)
 
 
 def _sheets_append(name, rows):
@@ -99,14 +136,30 @@ def _sheets_append(name, rows):
         return
     ws = _ws(name)
     values = [[r.get(c, "") for c in COLUMNS[name]] for r in rows]
-    _retry(ws.append_rows, values, value_input_option="USER_ENTERED")
+    # table_range="A1" anchors new rows to column A; without it Sheets can place
+    # appended rows a few columns to the right, under blank headers.
+    _retry(ws.append_rows, values, value_input_option="USER_ENTERED", table_range="A1")
 
 
 def _sheets_overwrite(name, df):
-    ws = _ws(name)
-    _retry(ws.clear)
+    """Write header + rows from A1 first, then clear whatever is left over.
+    (Clearing first meant a failed write could leave the tab empty, header included.)"""
+    cols = COLUMNS[name]
     values = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in df.values.tolist()]
-    _retry(ws.update, [COLUMNS[name]] + values, value_input_option="USER_ENTERED")
+    data = [cols] + values
+
+    ws = _retry(_spreadsheet().worksheet, name)  # fresh copy so the grid size is current
+    if ws.row_count < len(data):
+        _retry(ws.add_rows, len(data) - ws.row_count)
+    _retry(ws.update, data, "A1", value_input_option="USER_ENTERED")
+
+    stale = []
+    if ws.row_count > len(data):  # old rows below the new data
+        stale.append(f"A{len(data) + 1}:{_col(max(ws.col_count, len(cols)))}{ws.row_count}")
+    if ws.col_count > len(cols):  # stray cells to the right of the last header
+        stale.append(f"{_col(len(cols) + 1)}1:{_col(ws.col_count)}{len(data)}")
+    if stale:
+        _retry(ws.batch_clear, stale)
 
 
 # ---------------- Local CSV backend ----------------
