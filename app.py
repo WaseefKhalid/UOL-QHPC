@@ -10,7 +10,7 @@ import streamlit as st
 
 import db
 from parser import parse_stumps_pdf, parse_summary_image
-from stats import (NO_FORMAT, NOT_SET, guess_type, career_batting, career_bowling, batting_by_position, player_overview,
+from stats import (NO_FORMAT, NOT_SET, BALLS, guess_ball, guess_type, career_batting, career_bowling, batting_by_position, player_overview,
                    enrich, filter_rows, suggest_name_groups, search_names, team_matches, default_side,
                    team_key, duplicate_evidence, match_proof, batting_proof, find_duplicate_matches,
                    match_source, DUP_LABELS)
@@ -161,7 +161,7 @@ bowl_all["bowl_type"] = bowl_all["player"].map(types).fillna(NOT_SET)
 
 # ---------------- Sidebar: store status + filters ----------------
 PERIODS = ["All time", "Last 7 days", "Last 30 days", "Last 3 months", "This year", "Custom range"]
-FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_formats", "f_pos", "f_btype"]
+FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_ball", "f_formats", "f_pos", "f_btype"]
 
 
 def reset_filters():
@@ -220,6 +220,12 @@ with st.sidebar:
         include_undated = st.checkbox(f"Also include {n_undated} undated match(es)", value=False,
                                       key="f_undated", help="Screenshot uploads don't carry a date.")
 
+    # white ball / red ball
+    ball_opts = list(BALLS) + ([NOT_SET] if (matches["ball_label"] == NOT_SET).any() else [])
+    if "f_ball" in st.session_state:
+        st.session_state["f_ball"] = [b for b in st.session_state["f_ball"] if b in ball_opts]
+    ball_sel = st.multiselect("Ball", ball_opts, key="f_ball", placeholder="White and red ball")
+
     # match format
     formats = sorted(matches["format_label"].unique(), key=lambda f: (f == NO_FORMAT, f.lower()))
     if "f_formats" in st.session_state:
@@ -242,8 +248,8 @@ with st.sidebar:
     btype_sel = st.multiselect("Bowling type", btype_opts, key="f_btype", placeholder="Pace and spin",
                                help="Applies to bowling stats only.")
 
-    m_view = filter_rows(matches, date_range, include_undated, fmt_sel)
-    if date_range or fmt_sel or pos_sel or btype_sel:
+    m_view = filter_rows(matches, date_range, include_undated, fmt_sel, balls=ball_sel)
+    if date_range or ball_sel or fmt_sel or pos_sel or btype_sel:
         st.caption(f"Showing **{len(m_view)}** of {len(matches)} matches")
         st.button("↺  Reset filters", on_click=reset_filters)
 
@@ -265,14 +271,16 @@ with st.sidebar:
 
 # rows after filters (fielding isn't filtered by batting position: a catch has nothing
 # to do with where the catcher batted)
-bat_base = filter_rows(bat_all, date_range, include_undated, fmt_sel)
+bat_base = filter_rows(bat_all, date_range, include_undated, fmt_sel, balls=ball_sel)
 bat_f = filter_rows(bat_base, positions=pos_sel)
-bowl_f = filter_rows(bowl_all, date_range, include_undated, fmt_sel, bowl_types=btype_sel)
-field_f = filter_rows(field_all, date_range, include_undated, fmt_sel)
+bowl_f = filter_rows(bowl_all, date_range, include_undated, fmt_sel, bowl_types=btype_sel, balls=ball_sel)
+field_f = filter_rows(field_all, date_range, include_undated, fmt_sel, balls=ball_sel)
 
 note_parts = []
 if date_range:
     note_parts.append(f"{date_range[0]:%d %b %Y} – {date_range[1]:%d %b %Y}")
+if ball_sel:
+    note_parts.append(" & ".join(ball_sel))
 if fmt_sel:
     note_parts.append(", ".join(fmt_sel))
 if pos_sel:
@@ -398,7 +406,7 @@ if IS_ADMIN:
                         with st.expander("🔍 Proof — compare side by side"):
                             show_proof(mt, other, "This file", other_label,
                                        align_rows(p["batting"], other_bat), other_bat, c["reasons"])
-                    side = None
+                    side = ball = None
                     if action in ("new", "replace"):
                         default = default_side(mt["team_a"], mt["team_b"], our_names)
                         side = ctrl.selectbox(
@@ -407,8 +415,15 @@ if IS_ADMIN:
                             key=f"side_{fk}_{short_hash(names_sig)}",
                             placeholder="Pick your side", label_visibility="collapsed")
                         if side in ("A", "B", "AB"):
+                            guess = guess_ball(mt.get("format"), mt.get("overs"))
+                            ball = ctrl.selectbox(
+                                f"Ball for {name}", list(BALLS), key=f"ball_{fk}",
+                                index=BALLS.index(guess) if guess else None,
+                                placeholder="White ball or red ball?", label_visibility="collapsed")
                             _, b, w, _f = db.rows_for(p, set(side))
-                            ctrl.caption(f"Saves {len(b)} batting · {len(w)} bowling"
+                            ctrl.caption((f"⚠️ Pick white or red ball · " if not ball else
+                                          (f"{ball} (from format “{mt.get('format')}”) · " if guess else ""))
+                                         + f"Saves {len(b)} batting · {len(w)} bowling"
                                          + (" · replaces the saved copy" if action == "replace" else ""))
                             if side != "AB" and not team_matches(labels[side], our_names):
                                 unknown_names.add(labels[side])
@@ -418,7 +433,7 @@ if IS_ADMIN:
                             ctrl.caption("⚠️ Pick your side")
                     else:
                         ctrl.caption("Won't be saved")
-                choices.append((c, action, side))
+                choices.append((c, action, side, ball))
             if unknown_names:
                 st.caption(f"Tip: add {', '.join(sorted(unknown_names))} to “Your team name(s)” in the "
                            "sidebar and it'll be picked automatically.")
@@ -434,13 +449,20 @@ if IS_ADMIN:
                         dc.dataframe(pd.DataFrame(p["bowling"])[["team", "player", "wickets", "runs"]],
                                      hide_index=True, width="stretch")
 
-            live = [(c, action, side) for c, action, side in choices if action in ("new", "replace")]
-            pending = sum(1 for _, _, side in live if side is None)
-            to_save = [(c["p"], set(side)) for c, _, side in live if side in ("A", "B", "AB")]
-            to_replace = sorted({str(c["saved"]["match_id"]) for c, action, side in live
+            live = [(c, action, side, ball) for c, action, side, ball in choices if action in ("new", "replace")]
+            pending = sum(1 for _, _, side, _b in live if side is None)
+            no_ball = sum(1 for _, _, side, ball in live if side in ("A", "B", "AB") and not ball)
+            to_save = []
+            for c, _, side, ball in live:
+                if side in ("A", "B", "AB"):
+                    c["p"]["meta"]["ball"] = ball or ""
+                    to_save.append((c["p"], set(side)))
+            to_replace = sorted({str(c["saved"]["match_id"]) for c, action, side, _b in live
                                  if action == "replace" and side in ("A", "B", "AB")})
             if pending:
                 st.warning(f"Pick your side for {pending} match(es) — or choose “Skip this match”.")
+            if no_ball:
+                st.warning(f"Pick white ball or red ball for {no_ball} match(es).")
 
             # ---- your bowlers with no bowling type yet: ask once per player, pace or spin
             new_bowlers = sorted({r["player"] for p, sides in to_save for r in db.rows_for(p, sides)[2]
@@ -465,7 +487,7 @@ if IS_ADMIN:
 
             label = f"✅  Save {len(to_save)} match(es)" + (f" — replacing {len(to_replace)}" if to_replace else "")
             if cards and st.button(label, type="primary",
-                                   disabled=bool(pending) or bool(missing_types) or not to_save):
+                                   disabled=bool(pending) or bool(no_ball) or bool(missing_types) or not to_save):
                 with st.spinner(f"Saving {len(to_save)} match(es) to your sheet…"):
                     if bowl_choice:
                         db.set_bowling_types(bowl_choice)
@@ -499,6 +521,7 @@ if IS_ADMIN:
             if m_format == "Other…":
                 m_format = mc4.text_input("Type the format", key="m_format_typed")
             m_overs = mc5.text_input("Overs per side", key="m_overs", placeholder="e.g. 20")
+            m_ball = st.radio("Ball", list(BALLS), index=None, horizontal=True, key="m_ball")
 
             st.markdown("**Your batting** (one row per batter, in batting order)")
             bat_tmpl = pd.DataFrame([{"player": "", "runs": 0, "balls": 0, "fours": 0, "sixes": 0,
@@ -518,6 +541,7 @@ if IS_ADMIN:
                 mid = f"manual-{int(time.time())}"
                 p = {"meta": {"match_id": mid, "date": str(m_date), "format": (m_format or "").strip(),
                               "overs": m_overs.strip(), "result": res, "toss": "", "team_a": team,
+                              "ball": m_ball or "",
                               "team_b": tb.strip(), "score_a": sa, "score_b": sb}, "batting": [], "bowling": []}
                 for _, r in bat_edit.iterrows():
                     if _text(r["player"]):
@@ -544,6 +568,8 @@ if IS_ADMIN:
                            if b["player"] not in types and b["player"] not in typed_types]
                 if not (p["batting"] or p["bowling"]):
                     st.warning("Add at least one batter or bowler before saving.")
+                elif not m_ball:
+                    st.warning("Pick white ball or red ball.")
                 elif no_type:
                     st.warning(f"Pick pace or spin for new bowler(s): {', '.join(no_type)}.")
                 else:
@@ -596,8 +622,8 @@ def render_profile(name, bat_f, field_f, bowl_f):
         st.markdown("**Match by match**")
         mbm = pb.sort_values("date_dt", ascending=False, na_position="last")
         st.dataframe(pd.DataFrame({
-            "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Format": mbm["format_label"],
-            "Pos": mbm["position"], "How out": mbm["how_out"], "R": mbm["runs"], "B": mbm["balls"],
+            "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
+            "Format": mbm["format_label"], "Pos": mbm["position"], "How out": mbm["how_out"], "R": mbm["runs"], "B": mbm["balls"],
             "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]}),
             hide_index=True, width="stretch")
     else:
@@ -613,8 +639,8 @@ def render_profile(name, bat_f, field_f, bowl_f):
         st.markdown("**Match by match**")
         mbm = pw.sort_values("date_dt", ascending=False, na_position="last")
         st.dataframe(pd.DataFrame({
-            "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Format": mbm["format_label"],
-            "O": mbm["overs"], "M": mbm["maidens"], "R": mbm["runs"], "W": mbm["wickets"],
+            "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
+            "Format": mbm["format_label"], "O": mbm["overs"], "M": mbm["maidens"], "R": mbm["runs"], "W": mbm["wickets"],
             "Econ": mbm["econ"], "Wd": mbm["wides"], "NB": mbm["no_balls"]}),
             hide_index=True, width="stretch")
 
@@ -725,12 +751,27 @@ if IS_ADMIN:
         elif m_view.empty:
             st.info("No matches in the current filters.")
         else:
+            flash("ball_done")
             mv = m_view.sort_values("date_dt", ascending=False, na_position="last")
-            st.dataframe(pd.DataFrame({
-                "Date": fmt_date(mv["date_dt"]), "Format": mv["format_label"], "Overs": mv["overs"],
+            table = pd.DataFrame({
+                "Date": fmt_date(mv["date_dt"]),
+                "Ball": [b if b in BALLS else None for b in mv["ball_label"]],
+                "Format": mv["format_label"], "Overs": mv["overs"],
                 "Team A": mv["team_a"], "Score A": mv["score_a"], "Team B": mv["team_b"],
-                "Score B": mv["score_b"], "Result": mv["result"]}),
-                hide_index=True, width="stretch")
+                "Score B": mv["score_b"], "Result": mv["result"]}).reset_index(drop=True)
+            ids = mv["match_id"].tolist()
+            st.caption("You can change **Ball** here — pick a value in the column, then save.")
+            edited = st.data_editor(
+                table, hide_index=True, width="stretch", key=f"ball_ed_{short_hash('|'.join(ids))}",
+                disabled=[c for c in table.columns if c != "Ball"],
+                column_config={"Ball": st.column_config.SelectboxColumn("Ball", options=list(BALLS))})
+            ball_changes = {mid: new for mid, old, new in zip(ids, table["Ball"], edited["Ball"])
+                            if new in BALLS and new != old}
+            if st.button(f"💾  Save {len(ball_changes)} ball change(s)", disabled=not ball_changes,
+                         key="ball_save"):
+                db.set_match_ball(ball_changes)
+                st.session_state["ball_done"] = f"Updated ball type for {len(ball_changes)} match(es)."
+                st.rerun()
         st.divider()
         if st.button("⬇️  Build Excel export"):
             out = "/tmp/qhpc-cricket-db.xlsx"
