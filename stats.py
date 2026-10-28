@@ -878,3 +878,103 @@ def dismissal_breakdown(bat):
     out = pd.DataFrame({"How out": counts.index, "Times": counts.values})
     out["% of dismissals"] = (out["Times"] / max(len(outs), 1) * 100).round(0)
     return out, int((how == "not out").sum()), len(outs)
+
+
+# ---------------- squad list: scorecard name -> full name ----------------
+HONORIFICS = {"muhammad", "mohammad", "muhammed", "mohammed", "mohamed", "mohd", "md", "m"}
+GUEST = "➕ Not in squad list — keep as written"
+
+
+def clean_scorecard_name(name):
+    """Drop captain / keeper marks the scorer adds: 'Ali Raza (c)', '†Usman', 'Bilal*'."""
+    n = re.sub(r"\((?:c|wk|c\s*&\s*wk|wk\s*&\s*c|capt|captain|vc)\)", " ", str(name or ""), flags=re.I)
+    n = re.sub(r"[†*]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def name_key(name):
+    return clean_scorecard_name(name).lower()
+
+
+def _name_tokens(name):
+    toks = re.sub(r"[^a-z ]", " ", clean_scorecard_name(name).lower()).split()
+    core = [t for t in toks if t not in HONORIFICS]
+    return core or toks
+
+
+def _token_sim(r, f):
+    if r == f:
+        return 1.0
+    if len(r) == 1:
+        return 0.9 if f.startswith(r) else 0.0
+    s = difflib.SequenceMatcher(None, r, f).ratio()
+    if len(r) >= 3 and (f.startswith(r) or r.startswith(f)):
+        s = max(s, 0.85)
+    return s
+
+
+def _match(raw_toks, full_toks):
+    """Pair every scorecard token with a different full-name token. Returns (exact, lowest similarity)."""
+    free, sims, exact = list(full_toks), [], True
+    for r in raw_toks:
+        if not free:
+            return False, 0.0
+        best = max(free, key=lambda f: _token_sim(r, f))
+        s = _token_sim(r, best)
+        sims.append(s)
+        exact &= (r == best) or (len(r) == 1 and best.startswith(r))
+        free.remove(best)
+    return exact, min(sims) if sims else 0.0
+
+
+def squad_suggestions(raw, squad):
+    """Squad players this scorecard name could be: [(full_name, kind, score, reason)] best first.
+    kind 'exact' = every word of the scorecard name is in the full name (or is its initial)."""
+    rt = _name_tokens(raw)
+    if not rt:
+        return []
+    out = []
+    for full in squad:
+        ft = _name_tokens(full)
+        exact, low = _match(rt, ft)
+        whole = difflib.SequenceMatcher(None, " ".join(rt), " ".join(ft)).ratio()
+        if exact:
+            reason = "exact name" if len(rt) == len(ft) else (
+                "same first name" if rt[0] == ft[0] and len(rt) == 1 else "part of the full name")
+            out.append((full, "exact", 2 + whole, reason))
+        elif low >= 0.72:
+            out.append((full, "close", low + whole / 2, "close spelling"))
+        elif whole >= 0.6:
+            out.append((full, "weak", whole, "looks a bit like it"))
+    return sorted(out, key=lambda x: -x[2])
+
+
+def resolve_name(raw, squad, spellings):
+    """How to show a scorecard name. Returns dict(status, full, options, reason, default):
+    status 'auto' (certain: one exact match), 'remembered' (you answered before) or
+    'ask' (two or more players fit, or a new spelling). Names that fit several players are
+    asked every time, with last time's answer pre-selected."""
+    key = name_key(raw)
+    sugg = squad_suggestions(raw, squad)
+    exact = [s for s in sugg if s[1] == "exact"]
+    stored = spellings.get(key)
+    if stored:
+        full, in_squad = stored
+        if len(exact) >= 2:
+            return {"status": "ask", "full": None, "default": full, "options": [s[0] for s in sugg],
+                    "reason": f"fits {len(exact)} players"}
+        if in_squad and full in squad:
+            return {"status": "remembered", "full": full, "options": [], "reason": "you confirmed this before"}
+        if not in_squad and len(exact) == 1:     # a guest who has since joined the squad
+            return {"status": "auto", "full": exact[0][0], "options": [], "reason": "now in the squad list"}
+        if not in_squad:
+            return {"status": "remembered", "full": full, "options": [], "reason": "marked not in squad list"}
+    if len(exact) == 1:
+        return {"status": "auto", "full": exact[0][0], "options": [], "reason": exact[0][3]}
+    if len(exact) >= 2:
+        return {"status": "ask", "full": None, "default": None, "options": [s[0] for s in sugg],
+                "reason": f"fits {len(exact)} players: " + ", ".join(s[0] for s in exact[:3])}
+    if sugg:
+        return {"status": "ask", "full": None, "default": None, "options": [s[0] for s in sugg],
+                "reason": "new spelling — closest: " + ", ".join(s[0] for s in sugg[:2])}
+    return {"status": "ask", "full": None, "default": None, "options": [], "reason": "no one in the squad list looks like this"}
