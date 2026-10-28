@@ -13,7 +13,22 @@ BALLS = ("White ball", "Red ball")
 VENUES = ("Home", "Away")
 OUTCOMES = ("Won", "Lost", "Tied", "Drawn", "No result")
 INTRA = "Intra-squad"
-FORMAT_CHOICES = ["T20", "One Day", "2 Day", "3 Day", "PCB Club Match"]
+FORMAT_CHOICES = ["Inter Academy Senior Team Match", "Inter Academy Junior Team Match",
+                  "Intra Academy Senior Match", "Intra Academy Junior Match",
+                  "PCB Official Club Cricket Match"]
+
+
+def overs_from_scorecard(meta):
+    """Overs per side from the scorecard: the 'Overs' line, else a full innings like '(20.0)'."""
+    try:
+        v = float(str(meta.get("overs") or "").strip())
+        if v > 0:
+            return int(round(v))
+    except ValueError:
+        pass
+    full = [score_parts(meta.get(k))[2] for k in ("score_a", "score_b")]
+    full = [o for o in full if o and float(o).is_integer()]
+    return int(max(full)) if full else None
 
 
 def guess_ball(fmt, overs=""):
