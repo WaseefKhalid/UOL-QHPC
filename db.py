@@ -16,7 +16,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 COLUMNS = {
     "matches": ["match_id", "date", "type", "our_team", "team_a", "score_a",
-                "team_b", "score_b", "result", "format", "overs", "toss"],
+                "team_b", "score_b", "result", "format", "overs", "toss", "ball"],
     "batting": ["match_id", "date", "type", "team", "is_ours", "player", "how_out",
                 "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos"],
     "bowling": ["match_id", "date", "type", "team", "is_ours", "player", "overs",
@@ -319,6 +319,7 @@ def rows_for(parsed, sides):
         "our_team": " & ".join(names[s] for s in sorted(sides)), "team_a": meta["team_a"],
         "score_a": meta["score_a"], "team_b": meta["team_b"], "score_b": meta["score_b"],
         "result": meta["result"], "format": meta["format"], "overs": meta["overs"], "toss": meta["toss"],
+        "ball": meta.get("ball", ""),
     }
     extra = {"match_id": meta["match_id"], "date": meta["date"], "type": match_type, "is_ours": True}
     bat = [{**b, **extra} for b in parsed["batting"] if ours(b["team"])]
@@ -500,6 +501,22 @@ def set_bowling_types(updates):
             changed = True
     if changed:
         _save_types(types)
+    clear_cache()
+
+
+# ---------------- white ball / red ball ----------------
+def set_match_ball(updates):
+    """{match_id: 'White ball' | 'Red ball'} for matches already saved."""
+    m = load("matches")
+    ids = m["match_id"].astype(str)
+    changed = False
+    for mid, ball in updates.items():
+        hit = ids == str(mid)
+        if hit.any():
+            m.loc[hit, "ball"] = ball
+            changed = True
+    if changed:
+        _overwrite("matches", m)
     clear_cache()
 
 
