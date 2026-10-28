@@ -10,7 +10,9 @@ import streamlit as st
 import db
 from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, career_batting, career_bowling, batting_by_position, player_overview,
-                   enrich, filter_rows, suggest_name_groups, search_names)
+                   enrich, filter_rows, suggest_name_groups, search_names, team_matches, default_side,
+                   team_key, duplicate_evidence, match_proof, batting_proof, find_duplicate_matches,
+                   match_source, DUP_LABELS)
 
 st.set_page_config(page_title="QHPC Cricket Stats", page_icon="🏏", layout="wide")
 
@@ -61,13 +63,39 @@ def dash(v):
 
 
 @st.cache_data(show_spinner=False)
-def prepared(m_df, bat_df, bowl_df):
-    return enrich(m_df, bat_df, bowl_df)
+def prepared(m_df, bat_df, bowl_df, field_df):
+    return enrich(m_df, bat_df, bowl_df, field_df)
 
 
 @st.cache_data(show_spinner=False)
 def name_groups(names, ignored, threshold):
     return suggest_name_groups(list(names), threshold, ignore=ignored)
+
+
+@st.cache_data(show_spinner=False)
+def dup_pairs(matches, bat_all, ignored):
+    return find_duplicate_matches(matches, bat_all, ignore=ignored)
+
+
+def align_rows(rows, other):
+    """Rows of a parsed file limited to the team(s) that appear in `other`, so a file
+    (both teams) can be compared fairly with a saved match (your team only)."""
+    df, o = pd.DataFrame(rows), pd.DataFrame(other)
+    if df.empty or o.empty or "team" not in o or "team" not in df:
+        return df
+    teams = {team_key(t) for t in o["team"].astype(str)}
+    keep = df["team"].astype(str).map(team_key).isin(teams)
+    return df[keep] if keep.any() else df
+
+
+def show_proof(a, b, label_a, label_b, bat_a, bat_b, reasons, bowl_a=None, bowl_b=None):
+    st.markdown("\n".join(f"- {r}" for r in reasons))
+    st.dataframe(match_proof(a, b, label_a, label_b, bat_a, bat_b, bowl_a, bowl_b),
+                 hide_index=True, width="stretch")
+    bp = batting_proof(bat_a, bat_b, label_a, label_b)
+    if not bp.empty:
+        st.markdown("**Batter by batter** — runs (balls)")
+        st.dataframe(bp, hide_index=True, width="stretch")
 
 
 def name_details(bat_all, bowl_all):
@@ -90,8 +118,8 @@ def name_details(bat_all, bowl_all):
 
 # ---------------- data ----------------
 m_df = db.load("matches")
-bat_raw, bowl_raw = db.load("batting"), db.load("bowling")
-matches, bat_all, bowl_all = prepared(m_df, bat_raw, bowl_raw)
+bat_raw, bowl_raw, field_raw = db.load("batting"), db.load("bowling"), db.load("fielding")
+matches, bat_all, bowl_all, field_all = prepared(m_df, bat_raw, bowl_raw, field_raw)
 players = sorted(set(bat_all["player"]) | set(bowl_all["player"]))
 
 # ---------------- Sidebar: store status + filters ----------------
@@ -107,8 +135,10 @@ def reset_filters():
 with st.sidebar:
     st.header("🏏 QHPC Stats")
     st.session_state.our_team = st.text_input(
-        "Our team name", st.session_state.our_team,
-        help="Used to tag our players and to filter inter-academy matches.")
+        "Your team name(s)", st.session_state.our_team,
+        help="Only this team's players are saved. If the scorer writes it differently, "
+             "add each spelling separated by commas, e.g. UOL QHPC, UOL Qalandars")
+    our_names = [n.strip() for n in st.session_state.our_team.split(",") if n.strip()]
     online = db.use_sheets()
     st.caption(("🟢 " if online else "🟡 ") + "Data store: " + db.backend_label())
     if not online:
@@ -116,6 +146,11 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     c1.metric("Matches", len(matches))
     c2.metric("Players", len(players))
+    all_teams = sorted(set(bat_all["team"]) | set(bowl_all["team"]))
+    other_teams = [t for t in all_teams if not team_matches(t, our_names)]
+    if other_teams:
+        st.caption(f"⚠️ Your data still has stats for {len(other_teams)} other team(s). "
+                   "Remove them in 🛠 Manage.")
 
     st.divider()
     st.subheader("Filters")
@@ -165,11 +200,12 @@ with st.sidebar:
         st.caption(f"Showing **{len(m_view)}** of {len(matches)} matches")
         st.button("↺  Reset filters", on_click=reset_filters)
 
-# rows after filters: catches are counted before the position filter (a catch has nothing
+# rows after filters (fielding isn't filtered by batting position: a catch has nothing
 # to do with where the catcher batted)
 bat_base = filter_rows(bat_all, date_range, include_undated, fmt_sel)
 bat_f = filter_rows(bat_base, positions=pos_sel)
 bowl_f = filter_rows(bowl_all, date_range, include_undated, fmt_sel)
+field_f = filter_rows(field_all, date_range, include_undated, fmt_sel)
 
 note_parts = []
 if date_range:
@@ -205,7 +241,6 @@ with tab_add:
     files = sorted(ups or [], key=lambda u: not u.name.lower().endswith(".pdf"))  # PDFs first
     if files:
         parsed = st.session_state.setdefault("parsed", {})
-        existing = set(matches["match_id"])
         items = []
         for u in files:
             key = f"{u.name}-{u.size}"
@@ -219,20 +254,106 @@ with tab_add:
                     parsed[key] = {"error": str(e)}
             items.append((u.name, is_pdf, u, parsed[key]))
 
-        overview = []
+        # ---- sort every file into: new / duplicate of a saved match / duplicate of another file here
+        rank = {"certain": 0, "likely": 1, "possible": 2}
+        saved = matches.to_dict("records")
+        saved_by_id = {str(r["match_id"]): r for r in saved}
+        saved_bat = {mid: g for mid, g in bat_all.groupby("match_id")}
+        empty_bat = pd.DataFrame(columns=["team", "player", "runs", "balls"])
+        errors, cards, kept = [], [], []
         for name, is_pdf, u, p in items:
             kind = "PDF" if is_pdf else "Screenshot"
             if "error" in p:
-                overview.append({"File": name, "Type": kind, "Match": "could not read",
-                                 "Status": str(p["error"])[:40]})
+                errors.append({"File": name, "Type": kind, "Problem": str(p["error"])[:80]})
                 continue
             mt = p["meta"]
-            overview.append({"File": name, "Type": kind,
-                             "Match": f'{mt["team_a"]} vs {mt["team_b"]}',
-                             "Format": mt.get("format") or "—",
-                             "Read": f'{len(p["batting"])} bat / {len(p["bowling"])} bowl',
-                             "Status": "already saved" if str(mt["match_id"]) in existing else "new"})
-        st.dataframe(pd.DataFrame(overview), hide_index=True, width="stretch")
+            card = {"name": name, "kind": kind, "u": u, "p": p, "status": "new"}
+            for n2, k2, p2 in kept:
+                level, reasons = duplicate_evidence(mt, p2["meta"], p["batting"], p2["batting"])
+                if level:
+                    card.update(status="upload_dup", level=level, reasons=reasons, twin=(n2, k2, p2))
+                    break
+            if card["status"] == "new":
+                mid = str(mt["match_id"])
+                best = None
+                for r in ([saved_by_id[mid]] if mid in saved_by_id else saved):
+                    level, reasons = duplicate_evidence(mt, r, p["batting"],
+                                                        saved_bat.get(str(r["match_id"]), empty_bat))
+                    if level and (best is None or rank[level] < rank[best[0]]):
+                        best = (level, reasons, r)
+                if best:
+                    card.update(status="saved_dup", level=best[0], reasons=best[1], saved=best[2])
+                kept.append((name, kind, p))
+            cards.append(card)
+
+        n_new = sum(c["status"] == "new" for c in cards)
+        n_sd = sum(c["status"] == "saved_dup" for c in cards)
+        n_ud = sum(c["status"] == "upload_dup" for c in cards)
+        st.markdown(f"**{len(items)} file(s):** {n_new} new · {n_sd} look already saved · "
+                    f"{n_ud} duplicate another file here" + (f" · {len(errors)} couldn't be read" if errors else ""))
+        if errors:
+            st.dataframe(pd.DataFrame(errors), hide_index=True, width="stretch")
+        if n_sd or n_ud:
+            st.caption("Duplicates are skipped unless you choose otherwise. Open **Proof** on each one to check.")
+
+        ACT_SAVED = {"skip": "Skip — it's a duplicate", "replace": "Replace the saved copy with this file",
+                     "new": "Not a duplicate — save as a new match"}
+        ACT_UPLOAD = {"skip": "Skip — duplicate of another file here", "new": "Not a duplicate — save it too"}
+        choices, unknown_names = [], set()
+        names_sig = "|".join(our_names)
+        for c in cards:
+            name, kind, u, p = c["name"], c["kind"], c["u"], c["p"]
+            mt = p["meta"]
+            fk = short_hash(f"{name}-{u.size}")
+            labels = {"A": mt["team_a"] or "Team A", "B": mt["team_b"] or "Team B",
+                      "AB": "Both sides — intra-squad game", "skip": "Skip this match"}
+            with st.container(border=True):
+                info, ctrl = st.columns([3, 2])
+                info.markdown(f'**{labels["A"]}** vs **{labels["B"]}**')
+                info.caption(" · ".join(x for x in [name, kind, mt.get("format") or "", mt.get("date") or ""] if x))
+                action = "new"
+                if c["status"] != "new":
+                    if c["status"] == "saved_dup":
+                        other, other_label = c["saved"], f'Saved · ID {c["saved"]["match_id"]}'
+                        other_bat = saved_bat.get(str(other["match_id"]), empty_bat)
+                        opts = dict(ACT_SAVED)
+                        info.markdown(f'{DUP_LABELS[c["level"]]} of a saved match (ID {other["match_id"]})')
+                    else:
+                        n2, k2, p2 = c["twin"]
+                        other, other_label, other_bat = p2["meta"], n2, p2["batting"]
+                        opts = dict(ACT_UPLOAD)
+                        info.markdown(f'{DUP_LABELS[c["level"]]} of **{n2}** in this upload')
+                    if c["level"] == "certain":
+                        opts.pop("new", None)   # same match ID can't be saved twice
+                    action = ctrl.selectbox(f"What to do with {name}", list(opts), format_func=opts.get,
+                                            key=f"act_{fk}", label_visibility="collapsed")
+                    with st.expander("🔍 Proof — compare side by side"):
+                        show_proof(mt, other, "This file", other_label,
+                                   align_rows(p["batting"], other_bat), other_bat, c["reasons"])
+                side = None
+                if action in ("new", "replace"):
+                    default = default_side(mt["team_a"], mt["team_b"], our_names)
+                    side = ctrl.selectbox(
+                        f"Your team in {name}", list(labels), format_func=labels.get,
+                        index=list(labels).index(default) if default else None,
+                        key=f"side_{fk}_{short_hash(names_sig)}",
+                        placeholder="Pick your side", label_visibility="collapsed")
+                    if side in ("A", "B", "AB"):
+                        _, b, w, _f = db.rows_for(p, set(side))
+                        ctrl.caption(f"Saves {len(b)} batting · {len(w)} bowling"
+                                     + (" · replaces the saved copy" if action == "replace" else ""))
+                        if side != "AB" and not team_matches(labels[side], our_names):
+                            unknown_names.add(labels[side])
+                    elif side == "skip":
+                        ctrl.caption("Won't be saved")
+                    else:
+                        ctrl.caption("⚠️ Pick your side")
+                else:
+                    ctrl.caption("Won't be saved")
+            choices.append((c, action, side))
+        if unknown_names:
+            st.caption(f"Tip: add {', '.join(sorted(unknown_names))} to “Your team name(s)” in the "
+                       "sidebar and it'll be picked automatically.")
 
         # screenshots: show image next to what OCR read, so you can eyeball before saving
         for name, is_pdf, u, p in items:
@@ -245,39 +366,37 @@ with tab_add:
                     dc.dataframe(pd.DataFrame(p["bowling"])[["team", "player", "wickets", "runs"]],
                                  hide_index=True, width="stretch")
 
-        our_side = st.session_state.our_team
-        if st.button("✅  Save all new matches", type="primary"):
-            to_save, seen, skipped, errs = [], set(), 0, 0
-            for name, is_pdf, u, p in items:
-                if "error" in p:
-                    errs += 1
-                    continue
-                mid = str(p["meta"]["match_id"])
-                if mid in existing or mid in seen:
-                    skipped += 1
-                    continue
-                seen.add(mid)
-                to_save.append(p)
-            if to_save:
-                with st.spinner(f"Saving {len(to_save)} match(es) to your sheet…"):
-                    db.append_many(to_save, "intra", our_side)
-            msg = f"Saved {len(to_save)} new match(es)."
-            if skipped:
-                msg += f" Skipped {skipped} already saved."
-            if errs:
-                msg += f" {errs} couldn't be read."
-            st.session_state["add_done"] = msg
+        live = [(c, action, side) for c, action, side in choices if action in ("new", "replace")]
+        pending = sum(1 for _, _, side in live if side is None)
+        to_save = [(c["p"], set(side)) for c, _, side in live if side in ("A", "B", "AB")]
+        to_replace = sorted({str(c["saved"]["match_id"]) for c, action, side in live
+                             if action == "replace" and side in ("A", "B", "AB")})
+        if pending:
+            st.warning(f"Pick your side for {pending} match(es) — or choose “Skip this match”.")
+        label = f"✅  Save {len(to_save)} match(es)" + (f" — replacing {len(to_replace)}" if to_replace else "")
+        if cards and st.button(label, type="primary", disabled=bool(pending) or not to_save):
+            with st.spinner(f"Saving {len(to_save)} match(es) to your sheet…"):
+                for mid in to_replace:
+                    db.delete_match(mid)
+                nb, nw = db.append_many(to_save)
+            skipped = len(cards) - len(to_save)
+            st.session_state["add_done"] = (
+                f"Saved {len(to_save)} match(es): {nb} batting and {nw} bowling entries for your team."
+                + (f" Replaced {len(to_replace)} saved copy(ies)." if to_replace else "")
+                + (f" Skipped {skipped}." if skipped else ""))
             st.session_state.parsed = {}
             st.session_state["up_n"] = st.session_state.get("up_n", 0) + 1  # empties the uploader
             st.rerun()
+        elif cards and not to_save and not pending:
+            st.caption("Nothing to save — every file is skipped.")
 
     with st.expander("Add a match by hand (fallback if a screenshot won't read)"):
-        st.caption("Type what you can read. Leave blanks as 0. Enter batters in batting order.")
+        st.caption("Enter your team's players only. Leave blanks as 0. Enter batters in batting order.")
         mc1, mc2 = st.columns(2)
-        ta = mc1.text_input("Team A", key="m_ta")
-        sa = mc2.text_input("Team A score", key="m_sa", placeholder="e.g. 190-6 in 25.0 overs")
-        tb = mc1.text_input("Team B", key="m_tb")
-        sb = mc2.text_input("Team B score", key="m_sb")
+        ta = mc1.text_input("Your team", value=our_names[0] if our_names else "", key="m_ta")
+        sa = mc2.text_input("Your score", key="m_sa", placeholder="e.g. 190-6 in 25.0 overs")
+        tb = mc1.text_input("Opponent", key="m_tb")
+        sb = mc2.text_input("Opponent score", key="m_sb")
         res = st.text_input("Result", key="m_res", placeholder="e.g. UOL QHPC won by 15 runs")
         mc3, mc4, mc5 = st.columns(3)
         m_date = mc3.date_input("Date", value=today, key="m_date", format="DD/MM/YYYY")
@@ -287,53 +406,53 @@ with tab_add:
         if m_format == "Other…":
             m_format = mc4.text_input("Type the format", key="m_format_typed")
         m_overs = mc5.text_input("Overs per side", key="m_overs", placeholder="e.g. 20")
-        m_type = "intra"  # manual entries save both teams too
-        m_side = st.selectbox("Which team is ours?", [t for t in [ta, tb] if t] or ["—"], key="m_side")
 
-        st.markdown("**Batting** (one row per batter, in batting order)")
-        bat_tmpl = pd.DataFrame([{"team": "", "player": "", "runs": 0, "balls": 0,
-                                  "fours": 0, "sixes": 0, "not_out": False}])
+        st.markdown("**Your batting** (one row per batter, in batting order)")
+        bat_tmpl = pd.DataFrame([{"player": "", "runs": 0, "balls": 0, "fours": 0, "sixes": 0,
+                                  "not_out": False}])
         bat_edit = st.data_editor(bat_tmpl, num_rows="dynamic", hide_index=True,
                                   width="stretch", key="m_bat")
-        st.markdown("**Bowling** (one row per bowler)")
-        bowl_tmpl = pd.DataFrame([{"team": "", "player": "", "overs": 0.0, "maidens": 0,
-                                   "runs": 0, "wickets": 0, "wides": 0, "no_balls": 0}])
+        st.markdown("**Your bowling** (one row per bowler)")
+        bowl_tmpl = pd.DataFrame([{"player": "", "overs": 0.0, "maidens": 0, "runs": 0, "wickets": 0,
+                                   "wides": 0, "no_balls": 0}])
         bowl_edit = st.data_editor(bowl_tmpl, num_rows="dynamic", hide_index=True,
                                    width="stretch", key="m_bowl")
 
-        if st.button("✅  Save manual entry"):
+        if st.button("✅  Save manual entry", disabled=not ta.strip()):
+            team = ta.strip()
             mid = f"manual-{int(time.time())}"
             p = {"meta": {"match_id": mid, "date": str(m_date), "format": (m_format or "").strip(),
-                          "overs": m_overs.strip(), "result": res, "toss": "", "team_a": ta, "team_b": tb,
-                          "score_a": sa, "score_b": sb}, "batting": [], "bowling": []}
-            order = {}
+                          "overs": m_overs.strip(), "result": res, "toss": "", "team_a": team,
+                          "team_b": tb.strip(), "score_a": sa, "score_b": sb}, "batting": [], "bowling": []}
             for _, r in bat_edit.iterrows():
                 if _text(r["player"]):
-                    team = _text(r["team"])
-                    order[team] = order.get(team, 0) + 1
                     runs, balls = _int(r["runs"]), _int(r["balls"])
                     p["batting"].append({
                         "team": team, "player": _text(r["player"]),
                         "how_out": "not out" if bool(r["not_out"]) else "other", "bowler": "", "fielder": "",
                         "runs": runs, "balls": balls, "fours": _int(r["fours"]), "sixes": _int(r["sixes"]),
-                        "sr": round(runs / balls * 100, 2) if balls else 0, "pos": order[team]})
+                        "sr": round(runs / balls * 100, 2) if balls else 0,
+                        "pos": len(p["batting"]) + 1})
             for _, r in bowl_edit.iterrows():
                 if _text(r["player"]):
                     overs, runs = _float(r["overs"]), _int(r["runs"])
                     p["bowling"].append({
-                        "team": _text(r["team"]), "player": _text(r["player"]),
+                        "team": team, "player": _text(r["player"]),
                         "overs": overs, "maidens": _int(r["maidens"]), "runs": runs,
                         "wickets": _int(r["wickets"]),
                         "econ": round(runs / overs, 2) if overs else 0,
                         "dots": 0, "fours_conceded": 0, "sixes_conceded": 0,
                         "wides": _int(r["wides"]), "no_balls": _int(r["no_balls"])})
-            nb, nbw = db.append_match(p, m_type, m_side)
-            st.session_state["add_done"] = f"Saved {nb} batting and {nbw} bowling entries."
-            st.rerun()
+            if not (p["batting"] or p["bowling"]):
+                st.warning("Add at least one batter or bowler before saving.")
+            else:
+                nb, nbw = db.append_match(p, {"A"})
+                st.session_state["add_done"] = f"Saved {nb} batting and {nbw} bowling entries."
+                st.rerun()
 
 
 # ---------------- Player search ----------------
-def render_profile(name, bat_f, bat_base, bowl_f):
+def render_profile(name, bat_f, field_f, bowl_f):
     pb = bat_f[bat_f["player"] == name].sort_values("date_dt", na_position="first")
     pw = bowl_f[bowl_f["player"] == name].sort_values("date_dt", na_position="first")
     teams = sorted({t for t in pd.concat([pb["team"], pw["team"]]) if t})
@@ -348,11 +467,16 @@ def render_profile(name, bat_f, bat_base, bowl_f):
         if pb.empty:
             st.caption("No batting innings under the current filters.")
             return
-        r = career_batting(pb, catches_from=bat_base).iloc[0]
+        r = career_batting(pb, fielding=field_f).iloc[0]
         for col, (lbl, v) in zip(st.columns(8), [
                 ("Inns", r["Inns"]), ("Runs", r["Runs"]), ("HS", r["HS"]), ("Avg", dash(r["Avg"])),
                 ("SR", dash(r["SR"])), ("50s", r["50s"]), ("100s", r["100s"]), ("Catches", r["Catches"])]):
             col.metric(lbl, v)
+        fd = field_f.loc[field_f["player"] == name, "dismissal"].value_counts()
+        if fd.sum():
+            st.caption("Fielding: " + " · ".join(f"{int(fd.get(k, 0))} {lbl}" for k, lbl in [
+                ("caught", "catches"), ("caught & bowled", "caught & bowled"),
+                ("stumped", "stumpings"), ("run out", "run-outs")] if fd.get(k, 0)))
         left, right = st.columns([2, 3])
         with left:
             st.markdown("**By batting position**")
@@ -391,8 +515,8 @@ def render_profile(name, bat_f, bat_base, bowl_f):
             hide_index=True, width="stretch")
 
 
-def compare_table(names, bat_f, bat_base, bowl_f):
-    cb = career_batting(bat_f[bat_f["player"].isin(names)], catches_from=bat_base).set_index("Player")
+def compare_table(names, bat_f, field_f, bowl_f):
+    cb = career_batting(bat_f[bat_f["player"].isin(names)], fielding=field_f).set_index("Player")
     cw = career_bowling(bowl_f[bowl_f["player"].isin(names)]).set_index("Player")
     rows = {}
     for n in names:
@@ -416,7 +540,7 @@ def compare_table(names, bat_f, bat_base, bowl_f):
 
 
 @st.fragment
-def player_search(bat_f, bat_base, bowl_f, players):
+def player_search(bat_f, field_f, bowl_f, players):
     show_filter_note()
     if not players:
         st.info("No data yet — add a match to get started.")
@@ -430,7 +554,7 @@ def player_search(bat_f, bat_base, bowl_f, players):
     if fuzzy:
         st.caption(f"No exact match for “{q}” — closest spellings:")
 
-    overview = player_overview(bat_f, bowl_f, bat_base)
+    overview = player_overview(bat_f, bowl_f, field_f)
     found = overview[overview["Player"].isin(names)]
     missing = [n for n in names if n not in set(found["Player"])]
     if missing:   # players with no innings under the current filters
@@ -452,25 +576,25 @@ def player_search(bat_f, bat_base, bowl_f, players):
     st.divider()
     if others:
         st.markdown("**Side by side**")
-        st.dataframe(compare_table([pick] + others, bat_f, bat_base, bowl_f), width="stretch")
+        st.dataframe(compare_table([pick] + others, bat_f, field_f, bowl_f), width="stretch")
         st.divider()
-    render_profile(pick, bat_f, bat_base, bowl_f)
+    render_profile(pick, bat_f, field_f, bowl_f)
 
 
 with tab_search:
-    player_search(bat_f, bat_base, bowl_f, players)
+    player_search(bat_f, field_f, bowl_f, players)
 
 
 # ---------------- Leaderboards ----------------
 @st.fragment
-def leaderboards(bat_f, bat_base, bowl_f):
+def leaderboards(bat_f, field_f, bowl_f):
     c1, c2, c3 = st.columns([2, 1, 2])
     which = c1.radio("Show", ["Batting", "Bowling"], horizontal=True, key="lb_which")
     min_inns = c2.number_input("Min. innings", min_value=1, value=1, step=1, key="lb_min")
     q = c3.text_input("Find player", key="lb_q", placeholder="Filter the table by name")
     show_filter_note(batting=which == "Batting")
     if which == "Batting":
-        table = career_batting(bat_f, catches_from=bat_base)
+        table = career_batting(bat_f, fielding=field_f)
     else:
         table = career_bowling(bowl_f)
     table = table[table["Inns"] >= min_inns]
@@ -485,7 +609,7 @@ def leaderboards(bat_f, bat_base, bowl_f):
 
 
 with tab_board:
-    leaderboards(bat_f, bat_base, bowl_f)
+    leaderboards(bat_f, field_f, bowl_f)
 
 # ---------------- Matches ----------------
 with tab_matches:
@@ -513,6 +637,62 @@ with tab_matches:
 
 # ---------------- Manage ----------------
 GROUPS_PER_PAGE = 8
+
+
+@st.fragment
+def duplicate_scan(matches, bat_all, bowl_all):
+    st.subheader("Duplicate matches")
+    st.caption("Finds the same match saved twice — e.g. once from the PDF and once from a screenshot. "
+               "Check the proof, then choose which copy to keep. Nothing is deleted until you confirm.")
+    flash("dup_done")
+    if len(matches) < 2:
+        st.caption("Fewer than two matches saved.")
+        return
+    ignored = tuple(sorted(tuple(sorted(p)) for p in db.dup_ignored()))
+    found = dup_pairs(matches, bat_all, ignored)
+    if not found:
+        st.success("No duplicate matches found 👍")
+        return
+    st.markdown(f"**{len(found)} possible duplicate(s) found.**")
+    for d in found:
+        a, b = d["a"], d["b"]
+        ida, idb = str(a["match_id"]), str(b["match_id"])
+        k = short_hash(f"{ida}|{idb}|{d['level']}")
+        la, lb = f"Match 1 · {match_source(ida, a['date'])}", f"Match 2 · {match_source(idb, b['date'])}"
+        ba, bb = bat_all[bat_all["match_id"] == ida], bat_all[bat_all["match_id"] == idb]
+        wa, wb = bowl_all[bowl_all["match_id"] == ida], bowl_all[bowl_all["match_id"] == idb]
+        with st.container(border=True):
+            st.markdown(f"**{DUP_LABELS[d['level']]}** — {a['team_a']} vs {a['team_b']}")
+            show_proof(a, b, la, lb, ba, bb, d["reasons"], wa, wb)
+            if ida == idb:
+                st.caption("This match was saved twice under the same ID. Removing the extra copy keeps one "
+                           "copy of every row.")
+                sure = st.checkbox("I've checked the proof — remove the extra copy", key=f"dup_sure_{k}")
+                if st.button("🗑  Remove the extra copy", key=f"dup_go_{k}", disabled=not sure):
+                    db.remove_double_save(ida)
+                    st.session_state["dup_done"] = f"Removed the extra copy of match {ida}."
+                    st.rerun()
+                continue
+            more_a = len(ba) + len(wa) >= len(bb) + len(wb)
+            keep = st.radio(
+                "Which copy is right?", ["a", "b", "both"], index=0 if more_a else 1, horizontal=True,
+                key=f"dup_keep_{k}",
+                format_func={"a": f"Keep Match 1 (ID {ida}, {len(ba)} batters)",
+                             "b": f"Keep Match 2 (ID {idb}, {len(bb)} batters)",
+                             "both": "Not duplicates — keep both"}.get)
+            if keep == "both":
+                if st.button("✋  Not duplicates — stop flagging these two", key=f"dup_no_{k}"):
+                    db.add_dup_ignore(ida, idb)
+                    st.session_state["dup_done"] = "Noted — these two matches won't be flagged again."
+                    st.rerun()
+            else:
+                drop, drop_label = (idb, "Match 2") if keep == "a" else (ida, "Match 1")
+                sure = st.checkbox(f"I've checked the proof — delete {drop_label} (ID {drop}) and its stats",
+                                   key=f"dup_sure_{k}")
+                if st.button(f"🗑  Delete {drop_label}", key=f"dup_go_{k}", disabled=not sure):
+                    db.delete_match(drop)
+                    st.session_state["dup_done"] = f"Deleted {drop_label} (ID {drop}). The other copy is kept."
+                    st.rerun()
 
 
 @st.fragment
@@ -628,6 +808,8 @@ def merge_full_list(players, bat_all, bowl_all):
 
 
 with tab_manage:
+    duplicate_scan(matches, bat_all, bowl_all)
+    st.divider()
     similar_names(players, bat_all, bowl_all)
     st.divider()
     merge_full_list(players, bat_all, bowl_all)
@@ -649,16 +831,75 @@ with tab_manage:
             st.rerun()
 
     st.divider()
-    st.subheader("Delete a team's stats")
-    st.caption("Removes that team's batting and bowling rows (match fixtures stay in the Matches list).")
-    flash("delteam_done")
-    teams_all = sorted({t for t in pd.concat([bat_all["team"], bowl_all["team"]]) if t})
-    if not teams_all:
+    st.subheader("Remove other teams' stats")
+    flash("keepteams_done")
+    if not all_teams:
         st.caption("No team data.")
     else:
-        tpick = st.selectbox("Team", teams_all)
-        sure2 = st.checkbox("Yes — remove all of this team's player stats")
-        if st.button("🗑  Delete team stats", disabled=not sure2):
-            db.delete_team(tpick)
-            st.session_state["delteam_done"] = f"Removed {tpick}'s stats."
+        st.caption("Keeps the batting and bowling of the teams you tick as yours and deletes every "
+                   "other team's. Match results stay in the Matches list.")
+        rows = pd.concat([bat_all[["team", "player"]].assign(kind="bat"),
+                          bowl_all[["team", "player"]].assign(kind="bowl")])
+        counts = rows.groupby("team").agg(
+            Batting=("kind", lambda k: int((k == "bat").sum())),
+            Bowling=("kind", lambda k: int((k == "bowl").sum())),
+            Players=("player", "nunique"))
+        label = lambda t: t or "(no team name)"
+        keep_sel = st.multiselect(
+            "Your team(s) — keep these", all_teams, default=[t for t in all_teams if t not in other_teams],
+            format_func=label, key=f"keep_teams_{short_hash('|'.join(our_names) + '|'.join(all_teams))}")
+        remove = [t for t in all_teams if t not in keep_sel]
+        if not keep_sel:
+            st.warning("Tick at least one team to keep.")
+        elif not remove:
+            st.success("Only your team's stats are saved 👍")
+        else:
+            st.markdown(f"**Will delete stats for {len(remove)} team(s):**")
+            st.dataframe(counts.loc[remove].rename(index=label).rename_axis("Team").reset_index(),
+                         hide_index=True, width="stretch")
+            sure2 = st.checkbox("Yes — delete these teams' player stats", key="keep_teams_sure")
+            if st.button("🗑  Delete other teams' stats", disabled=not sure2):
+                n = db.keep_only_teams(keep_sel)
+                st.session_state["keepteams_done"] = f"Removed {n} rows from {len(remove)} other team(s)."
+                st.rerun()
+
+    # ---------------- Start from zero ----------------
+    st.divider()
+    st.subheader("Start from zero")
+    st.caption("Deletes every saved match and all player stats so you can upload everything again. "
+               "The sheet's headers stay, so the app keeps working.")
+    flash("reset_done")
+    if st.session_state.pop("reset_clear", False):
+        st.session_state.pop("reset_typed", None)
+        st.session_state.pop("backup_xlsx", None)
+    totals = {"Matches": len(m_df), "Batting rows": len(bat_raw), "Bowling rows": len(bowl_raw),
+              "Fielding rows": len(field_raw), "Players": len(players)}
+    if not any(totals.values()):
+        st.caption("Nothing is saved — you're already at zero.")
+    else:
+        st.markdown("**This will delete:**")
+        st.dataframe(pd.DataFrame([totals]), hide_index=True, width="stretch")
+        st.markdown("**1. Download a backup first** (so nothing is lost if you need it later)")
+        if st.button("📦  Prepare backup", key="backup_btn"):
+            out = "/tmp/qhpc-backup.xlsx"
+            db.export_excel(out)
+            with open(out, "rb") as f:
+                st.session_state["backup_xlsx"] = f.read()
+        if st.session_state.get("backup_xlsx"):
+            st.download_button("⬇️  Download backup (.xlsx)", st.session_state["backup_xlsx"],
+                               file_name=f"qhpc-backup-{today:%Y-%m-%d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.markdown("**2. Confirm**")
+        forget = st.checkbox("Also forget my “not the same player” and “not duplicates” decisions",
+                             key="reset_forget",
+                             help="Leave this off to keep those decisions for when you upload again.")
+        typed = st.text_input("Type DELETE to confirm", key="reset_typed", placeholder="DELETE")
+        if st.button("🧨  Delete all data", type="primary", disabled=typed.strip() != "DELETE"):
+            with st.spinner("Deleting everything…"):
+                db.delete_all(forget_decisions=forget)
+            st.session_state.parsed = {}
+            st.session_state["reset_clear"] = True
+            st.session_state["reset_done"] = (f"All data deleted ({totals['Matches']} matches, "
+                                              f"{totals['Players']} players). Upload your files again on "
+                                              "the ➕ Add matches tab.")
             st.rerun()
