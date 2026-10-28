@@ -11,6 +11,7 @@ INK, MUTED, LINE = "#1C2B25", "#5E6E66", "#D3E6DB"
 
 ORG = "UOL · Qalandars High Performance Centre"
 APP = "UOL QHPC Cricket Stats"
+STATS_FROM = "28 October 2026"   # shown at the top of every page
 LOGO = os.path.join(os.path.dirname(__file__), "assets", "logo.png")  # optional: drop your logo here
 
 CSS = f"""
@@ -35,6 +36,11 @@ CSS = f"""
 .qh-sub {{ color: {MUTED}; font-size: .9rem; }}
 .qh-meta {{ text-align: right; color: {MUTED}; font-size: .82rem; line-height: 1.55; }}
 .qh-meta b {{ color: {DEEP}; font-weight: 700; }}
+
+/* coverage notice */
+.qh-scope {{ display: flex; align-items: center; gap: 10px; background: {TINT}; border-left: 4px solid {BRIGHT};
+            border-radius: 6px; padding: 9px 14px; margin: 10px 0 6px; color: {DEEP}; font-size: .9rem; }}
+.qh-scope b {{ font-weight: 700; }}
 
 /* tabs */
 .stTabs [data-baseweb="tab-list"] {{ gap: 6px; border-bottom: 1px solid {LINE}; }}
@@ -139,7 +145,9 @@ def masthead(n_matches, n_players, last_date=None):
     </div>
   </div>
   <div class="qh-meta">{meta}</div>
-</div>""", unsafe_allow_html=True)
+</div>
+<div class="qh-scope">📅 <span>This site carries stats of matches played from <b>{esc(STATS_FROM)}</b> onwards.</span></div>""",
+                unsafe_allow_html=True)
 
 
 def sidebar_brand():
@@ -175,7 +183,7 @@ def chips(values):
 
 
 def footer(updated=None):
-    right = "Data: STUMPS scorecards"
+    right = f"Matches from {STATS_FROM} onwards · Data: STUMPS scorecards"
     if updated is not None and pd.notna(updated):
         right += f" · Updated {updated:%d %b %Y}"
     st.markdown(f'<div class="qh-foot"><span>{esc(ORG)} · Performance Analysis</span>'
