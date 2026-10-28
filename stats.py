@@ -9,6 +9,20 @@ BAT_COLS = ["Player", "Inns", "NO", "Runs", "Balls", "HS", "Avg", "SR", "50s", "
 BOWL_COLS = ["Player", "Inns", "Overs", "Mdns", "Runs", "Wkts", "Avg", "Econ", "Best", "3W+", "Wd", "NB"]
 NO_FORMAT = "Not recorded"
 NOT_SET = "Not set"
+BALLS = ("White ball", "Red ball")
+
+
+def guess_ball(fmt, overs=""):
+    """White or red ball from the match format text (None if it can't tell)."""
+    f = str(fmt or "").lower()
+    if re.search(r"\b(t20|t10|odi|one[- ]day|limited|hundred|\d+\s*overs?)\b", f):
+        return "White ball"
+    if re.search(r"\b(test|first[- ]class|multi[- ]?day|\d+[- ]?days?|two[- ]day|three[- ]day|four[- ]day|unlimited)\b", f):
+        return "Red ball"
+    try:
+        return "White ball" if 0 < float(overs) <= 50 else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------- small helpers ----------------
@@ -171,6 +185,8 @@ def match_table(m_df):
         m[c] = m[c].fillna("").astype(str).str.strip()
     m["date_dt"] = parse_dates(m["date"])
     m["format_label"] = m["format"].str.replace(r"\s+", " ", regex=True).replace("", NO_FORMAT)
+    ball = m["ball"] if "ball" in m else pd.Series("", index=m.index)
+    m["ball_label"] = ball.fillna("").astype(str).where(lambda b: b.isin(BALLS), NOT_SET)
     return m
 
 
@@ -203,6 +219,7 @@ def enrich(m_df, bat, bowl, field=None):
             dates[missing] = parse_dates(df.loc[missing, "date"])
         df["date_dt"] = pd.to_datetime(dates)
         df["format_label"] = _lookup(df["match_id"], info["format_label"]).fillna(NO_FORMAT)
+        df["ball_label"] = _lookup(df["match_id"], info["ball_label"]).fillna(NOT_SET)
         ta = _lookup(df["match_id"], info["team_a"]).fillna("")
         tb = _lookup(df["match_id"], info["team_b"]).fillna("")
         df["opponent"] = np.where(df["team"] == ta, tb, np.where(df["team"] == tb, ta, ""))
@@ -232,7 +249,8 @@ def enrich(m_df, bat, bowl, field=None):
     return m, bat, bowl, field
 
 
-def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None):
+def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None,
+                balls=None):
     out = df
     if date_range:
         lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
@@ -246,6 +264,8 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
         out = out[out["position"].isin(positions).fillna(False).astype(bool)]
     if bowl_types:
         out = out[out["bowl_type"].isin(bowl_types)]
+    if balls:
+        out = out[out["ball_label"].isin(balls)]
     return out
 
 
