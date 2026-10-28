@@ -34,14 +34,19 @@ def _sr(runs, balls):
 
 
 # ---------------- career tables ----------------
-def career_batting(bat, catches_from=None):
-    """Batting table per player. `catches_from` lets catches be counted from a wider set of
-    rows than the batting rows shown (e.g. when filtering by batting position)."""
+CATCHES = ("caught", "caught & bowled")
+
+
+def career_batting(bat, fielding=None):
+    """Batting table per player. Catches come from `fielding` (one row per catch/stumping/
+    run-out by your players); without it, from the fielder column of the batting rows."""
     if bat is None or bat.empty:
         return pd.DataFrame(columns=BAT_COLS)
-    src = bat if catches_from is None else catches_from
-    caught = src[src["how_out"].isin(["caught", "caught & bowled"])]
-    catches = caught["fielder"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().value_counts()
+    if fielding is not None:
+        catches = fielding.loc[fielding["dismissal"].isin(CATCHES), "player"].value_counts()
+    else:
+        caught = bat[bat["how_out"].isin(CATCHES)]
+        catches = caught["fielder"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().value_counts()
     has_pos = "position" in bat.columns
 
     rows = []
@@ -105,9 +110,9 @@ def batting_by_position(bat):
     return pd.DataFrame(rows, columns=["Pos", "Inns", "Runs", "HS", "Avg", "SR"])
 
 
-def player_overview(bat, bowl, catches_from=None):
+def player_overview(bat, bowl, fielding=None):
     """One row per player with headline batting + bowling numbers (used by Player search)."""
-    cb = career_batting(bat, catches_from)[["Player", "Inns", "Runs", "HS", "Avg", "SR"]]
+    cb = career_batting(bat, fielding)[["Player", "Inns", "Runs", "HS", "Avg", "SR"]]
     cb = cb.rename(columns={"Inns": "Bat inns", "Avg": "Bat avg"})
     cw = career_bowling(bowl)[["Player", "Inns", "Wkts", "Best", "Avg", "Econ"]]
     cw = cw.rename(columns={"Inns": "Bowl inns", "Avg": "Bowl avg"})
@@ -150,6 +155,11 @@ def parse_dates(values):
     return out.dt.normalize()
 
 
+def _lookup(keys, column):
+    """column[key] for each key (NaN where missing). Safe on empty data, unlike Series.map."""
+    return pd.Series(column.reindex(keys.to_numpy()).to_numpy(), index=keys.index)
+
+
 def match_table(m_df):
     m = m_df.copy()
     m["match_id"] = m["match_id"].astype(str)
@@ -160,12 +170,19 @@ def match_table(m_df):
     return m
 
 
-def enrich(m_df, bat, bowl):
+FIELD_COLS = ["match_id", "date", "type", "team", "player", "dismissal"]
+FIELDING_DISMISSALS = ("caught", "caught & bowled", "stumped", "run out")
+
+
+def enrich(m_df, bat, bowl, field=None):
     """Attach date, match format, opponent and batting position to every row.
 
     Batting position comes from the `pos` column when it was saved; for older rows it is
     the batting order inside the match (rows are stored in scorecard order). Screenshot
-    uploads only list top scorers, so their position is left unknown."""
+    uploads only list top scorers, so their position is left unknown.
+
+    Fielding: rows from the fielding tab, plus — for older matches saved before that tab
+    existed — catches read from the fielder column of the batting rows."""
     m = match_table(m_df)
     info = m.drop_duplicates("match_id").set_index("match_id")
     screenshot_ids = set(m.loc[(m["date"] == "") & ~m["match_id"].str.startswith("manual-"), "match_id"])
@@ -176,23 +193,39 @@ def enrich(m_df, bat, bowl):
         df["player"] = df["player"].fillna("").astype(str)
         df = df[df["player"].str.strip() != ""].copy()
         df["team"] = df["team"].fillna("").astype(str)
-        dates = df["match_id"].map(info["date_dt"])
+        dates = _lookup(df["match_id"], info["date_dt"])
         missing = dates.isna()
         if missing.any():
             dates[missing] = parse_dates(df.loc[missing, "date"])
         df["date_dt"] = pd.to_datetime(dates)
-        df["format_label"] = df["match_id"].map(info["format_label"]).fillna(NO_FORMAT)
-        ta = df["match_id"].map(info["team_a"]).fillna("")
-        tb = df["match_id"].map(info["team_b"]).fillna("")
+        df["format_label"] = _lookup(df["match_id"], info["format_label"]).fillna(NO_FORMAT)
+        ta = _lookup(df["match_id"], info["team_a"]).fillna("")
+        tb = _lookup(df["match_id"], info["team_b"]).fillna("")
         df["opponent"] = np.where(df["team"] == ta, tb, np.where(df["team"] == tb, ta, ""))
         return df
 
-    bat, bowl = attach(bat), attach(bowl)
+    field = (field.copy() if field is not None else pd.DataFrame(columns=FIELD_COLS)).reindex(columns=FIELD_COLS)
+    field["match_id"] = field["match_id"].astype(str)
+    old = bat.copy()
+    old["match_id"] = old["match_id"].astype(str)
+    old = old[~old["match_id"].isin(set(field["match_id"])) & old["how_out"].isin(FIELDING_DISMISSALS)]
+    old_f = old["fielder"].fillna("").astype(str).str.strip()
+    old = old[old_f != ""]
+    if not old.empty:
+        ta = _lookup(old["match_id"], info["team_a"]).fillna("")
+        tb = _lookup(old["match_id"], info["team_b"]).fillna("")
+        team = old["team"].fillna("").astype(str)
+        derived_f = pd.DataFrame({"match_id": old["match_id"], "date": old["date"], "type": old["type"],
+                                  "team": np.where(team == ta, tb, ta), "player": old_f[old_f != ""],
+                                  "dismissal": old["how_out"]})
+        field = pd.concat([field, derived_f], ignore_index=True)
+
+    bat, bowl, field = attach(bat), attach(bowl), attach(field)
     saved = pd.to_numeric(bat["pos"], errors="coerce").fillna(0) if "pos" in bat else pd.Series(0, index=bat.index)
     order = bat.groupby(["match_id", "team"], sort=False).cumcount() + 1
     derived = order.where(~bat["match_id"].isin(screenshot_ids))
     bat["position"] = saved.where(saved > 0, derived).astype("Int64")
-    return m, bat, bowl
+    return m, bat, bowl, field
 
 
 def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None):
@@ -208,6 +241,219 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
     if positions:
         out = out[out["position"].isin(positions).fillna(False).astype(bool)]
     return out
+
+
+# ---------------- your team ----------------
+def team_key(name):
+    return re.sub(r"[^a-z0-9]+", " ", str(name).lower()).strip()
+
+
+def team_matches(team, our_names, threshold=0.85):
+    """True if a team name is one of yours: same name ignoring case/punctuation, a near
+    spelling, or your name plus extra words ("UOL QHPC Whites" for "UOL QHPC")."""
+    t = team_key(team)
+    if not t:
+        return False
+    for n in our_names:
+        k = team_key(n)
+        if not k:
+            continue
+        if t == k or re.search(rf"\b{re.escape(k)}\b", t):
+            return True
+        if difflib.SequenceMatcher(None, t, k).ratio() >= threshold:
+            return True
+    return False
+
+
+def default_side(team_a, team_b, our_names):
+    """'A', 'B', 'AB' (both are yours) or None (can't tell)."""
+    hits = [s for s, t in (("A", team_a), ("B", team_b)) if team_matches(t, our_names)]
+    if len(hits) == 2:
+        return "AB"
+    return hits[0] if hits else None
+
+
+# ---------------- duplicate matches ----------------
+def score_parts(score):
+    """'150-5 in 20.0 overs' -> (150, 5, 20.0). Missing parts come back as None."""
+    s = str(score or "")
+    m = re.search(r"(\d+)\s*[-/]\s*(\d+)", s)
+    if m:
+        runs, wkts = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"\d+", s)
+        runs, wkts = (int(m.group()) if m else None), None
+    o = re.search(r"in\s*([\d.]+)\s*overs?", s)
+    return runs, wkts, (float(o.group(1)) if o else None)
+
+
+def match_source(match_id, date=""):
+    mid = str(match_id)
+    if mid.startswith("manual-"):
+        return "Manual entry"
+    if mid.startswith("ss-") or not str(date or "").strip():
+        return "Screenshot"
+    return "PDF"
+
+
+def _team_same(a, b):
+    ka, kb = team_key(a), team_key(b)
+    return bool(ka) and bool(kb) and (ka == kb or difflib.SequenceMatcher(None, ka, kb).ratio() >= 0.8)
+
+
+def _pair_innings(a, b):
+    """Line up the two innings of match a with match b (teams may be listed in either order)."""
+    ia = [(a.get("team_a", ""), a.get("score_a", "")), (a.get("team_b", ""), a.get("score_b", ""))]
+    ib = [(b.get("team_a", ""), b.get("score_a", "")), (b.get("team_b", ""), b.get("score_b", ""))]
+    for order in (ib, ib[::-1]):
+        if all(_team_same(x[0], y[0]) for x, y in zip(ia, order)):
+            return list(zip(ia, order))
+    return None
+
+
+def _bat_frame(rows):
+    df = pd.DataFrame(rows) if not isinstance(rows, pd.DataFrame) else rows
+    if df.empty or "player" not in df:
+        return pd.DataFrame(columns=["key", "player", "runs", "balls"])
+    df = df[["player", "runs", "balls"]].copy()
+    df["player"] = df["player"].fillna("").astype(str).str.strip()
+    df["key"] = df["player"].str.lower()
+    df["runs"] = pd.to_numeric(df["runs"], errors="coerce").fillna(0).astype(int)
+    df["balls"] = pd.to_numeric(df["balls"], errors="coerce").fillna(0).astype(int)
+    return df[df["key"] != ""].drop_duplicates("key")
+
+
+def batting_overlap(rows_a, rows_b):
+    """(players in both, of those how many have identical runs and balls)."""
+    a, b = _bat_frame(rows_a), _bat_frame(rows_b)
+    both = a.merge(b, on="key", suffixes=("_a", "_b"))
+    same = int(((both["runs_a"] == both["runs_b"]) & (both["balls_a"] == both["balls_b"])).sum())
+    return len(both), same
+
+
+def duplicate_evidence(a, b, bat_a=None, bat_b=None):
+    """Is match b the same match as match a? Returns (level, reasons):
+    level is 'certain' (same match ID), 'likely', 'possible' or None (not a duplicate)."""
+    reasons = []
+    same_id = str(a.get("match_id", "")).strip() and str(a.get("match_id")) == str(b.get("match_id"))
+    if same_id:
+        reasons.append(f"Same match ID ({a['match_id']})")
+
+    pairs = _pair_innings(a, b)
+    if pairs is None:
+        return ("certain", reasons) if same_id else (None, [])
+    reasons.append("Same two teams")
+
+    compared, shown = 0, []
+    for (ta, sa), (tb, sb) in pairs:
+        ra, wa, _ = score_parts(sa)
+        rb, wb, _ = score_parts(sb)
+        if ra is None or rb is None:
+            continue
+        if ra != rb or (wa is not None and wb is not None and wa != wb):
+            return ("certain", reasons) if same_id else (None, [])
+        compared += 1
+        shown.append(f"{ta} {ra}" + (f"-{wa}" if wa is not None else ""))
+    if compared == 0 and not same_id:
+        return None, []
+    if shown:
+        reasons.append("Same score: " + ", ".join(shown))
+
+    da, db_ = parse_dates([a.get("date", ""), b.get("date", "")])
+    if pd.notna(da) and pd.notna(db_):
+        if da != db_ and not same_id:
+            return None, []
+        if da == db_:
+            reasons.append(f"Same date ({da:%d %b %Y})")
+    else:
+        reasons.append("Date missing on one of them")
+
+    level = "certain" if same_id else ("likely" if compared == 2 else "possible")
+    if bat_a is not None and bat_b is not None:
+        common, same = batting_overlap(bat_a, bat_b)
+        if common:
+            reasons.append(f"{same} of {common} batters in both have identical runs and balls")
+            if not same_id and same < common / 2:
+                level = "possible"
+    return level, reasons
+
+
+DUP_LABELS = {"certain": "🟥 Certain duplicate", "likely": "🟧 Very likely duplicate",
+              "possible": "🟨 Possible duplicate"}
+
+
+def match_proof(a, b, label_a, label_b, bat_a=None, bat_b=None, bowl_a=None, bowl_b=None):
+    """Side-by-side table of two matches with a ✅/❌ per field."""
+    def score_line(m, team):
+        for t, s in ((m.get("team_a", ""), m.get("score_a", "")), (m.get("team_b", ""), m.get("score_b", ""))):
+            if _team_same(t, team):
+                return f"{t}: {s or '—'}"
+        return "—"
+
+    def same_score(x, y):
+        rx, wx, _ = score_parts(x.split(": ", 1)[-1])
+        ry, wy, _ = score_parts(y.split(": ", 1)[-1])
+        return rx is not None and rx == ry and (wx is None or wy is None or wx == wy)
+
+    da, db_ = parse_dates([a.get("date", ""), b.get("date", "")])
+    rows = [
+        ("Match ID", str(a.get("match_id", "")), str(b.get("match_id", "")), None),
+        ("Source", match_source(a.get("match_id"), a.get("date")), match_source(b.get("match_id"), b.get("date")), ""),
+        ("Date", f"{da:%d %b %Y}" if pd.notna(da) else "—", f"{db_:%d %b %Y}" if pd.notna(db_) else "—", None),
+        ("Format", a.get("format") or "—", b.get("format") or "—", None),
+    ]
+    for team in (a.get("team_a", ""), a.get("team_b", "")):
+        x, y = score_line(a, team), score_line(b, team)
+        rows.append(("Score", x, y, "✅" if same_score(x, y) else "❌"))
+    rows.append(("Result", a.get("result") or "—", b.get("result") or "—", None))
+    if bat_a is not None and bat_b is not None:
+        rows.append(("Batting rows", str(len(bat_a)), str(len(bat_b)), ""))
+    if bowl_a is not None and bowl_b is not None:
+        rows.append(("Bowling rows", str(len(bowl_a)), str(len(bowl_b)), ""))
+
+    out = []
+    for field, x, y, mark in rows:
+        if mark is None:
+            mark = "—" if "—" in (x, y) else ("✅" if team_key(x) == team_key(y) else "❌")
+        out.append({"": field, label_a: x, label_b: y, "Same?": mark})
+    return pd.DataFrame(out)
+
+
+def batting_proof(rows_a, rows_b, label_a, label_b):
+    """Batter-by-batter comparison: runs (balls) in each match."""
+    a, b = _bat_frame(rows_a), _bat_frame(rows_b)
+    both = a.merge(b, on="key", how="outer", suffixes=("_a", "_b"))
+    out = []
+    for _, r in both.iterrows():
+        has_a, has_b = pd.notna(r["runs_a"]), pd.notna(r["runs_b"])
+        out.append({
+            "Player": r["player_a"] if has_a else r["player_b"],
+            label_a: f"{int(r['runs_a'])} ({int(r['balls_a'])})" if has_a else "—",
+            label_b: f"{int(r['runs_b'])} ({int(r['balls_b'])})" if has_b else "—",
+            "Same?": ("✅" if (r["runs_a"] == r["runs_b"] and r["balls_a"] == r["balls_b"]) else "❌")
+                     if has_a and has_b else "—",
+        })
+    return pd.DataFrame(out, columns=["Player", label_a, label_b, "Same?"])
+
+
+def find_duplicate_matches(matches_df, bat_df, ignore=()):
+    """Pairs of saved matches that look like the same match. Returns a list of
+    dicts {a, b, level, reasons}; `ignore` holds match-id pairs marked 'not duplicates'."""
+    ignore = {frozenset(p) for p in ignore}
+    recs = matches_df.to_dict("records")
+    bats = {mid: g for mid, g in bat_df.groupby("match_id")} if not bat_df.empty else {}
+    empty = pd.DataFrame(columns=["player", "runs", "balls"])
+    out, order = [], {"certain": 0, "likely": 1, "possible": 2}
+    for i in range(len(recs)):
+        for j in range(i + 1, len(recs)):
+            a, b = recs[i], recs[j]
+            ida, idb = str(a["match_id"]), str(b["match_id"])
+            if frozenset((ida, idb)) in ignore and ida != idb:
+                continue
+            level, reasons = duplicate_evidence(a, b, bats.get(ida, empty), bats.get(idb, empty))
+            if level:
+                out.append({"a": a, "b": b, "level": level, "reasons": reasons})
+    return sorted(out, key=lambda d: order[d["level"]])
 
 
 # ---------------- Name cleanup helpers ----------------
