@@ -10,6 +10,10 @@ BOWL_COLS = ["Player", "Inns", "Overs", "Mdns", "Runs", "Wkts", "Avg", "Econ", "
 NO_FORMAT = "Not recorded"
 NOT_SET = "Not set"
 BALLS = ("White ball", "Red ball")
+VENUES = ("Home", "Away")
+OUTCOMES = ("Won", "Lost", "Tied", "Drawn", "No result")
+INTRA = "Intra-squad"
+FORMAT_CHOICES = ["T20", "One Day", "2 Day", "3 Day", "PCB Club Match"]
 
 
 def guess_ball(fmt, overs=""):
@@ -185,15 +189,75 @@ def _lookup(keys, column):
     return pd.Series(column.reindex(keys.to_numpy()).to_numpy(), index=keys.index)
 
 
+def _side(name, team_a, team_b):
+    """'A' / 'B' / None — which team a name refers to (exact, then near spelling)."""
+    k, a, b = team_key(name), team_key(team_a), team_key(team_b)
+    if not k:
+        return None
+    if k == a:
+        return "A"
+    if k == b:
+        return "B"
+    ra = difflib.SequenceMatcher(None, k, a).ratio() if a else 0
+    rb = difflib.SequenceMatcher(None, k, b).ratio() if b else 0
+    if max(ra, rb) < 0.6:
+        return None
+    return "A" if ra >= rb else "B"
+
+
+def guess_outcome(result, team_a, team_b, our_side):
+    """Won / Lost / Tied / Drawn / No result for your side, read from the result line.
+    None when the line can't be read."""
+    r = str(result or "").lower()
+    if not r.strip() or our_side not in ("A", "B"):
+        return None
+    if re.search(r"\btie[d]?\b", r):
+        return "Tied"
+    if re.search(r"\b(draw|drawn)\b", r):
+        return "Drawn"
+    if re.search(r"\b(no result|abandon|abandoned|washed out)\b", r):
+        return "No result"
+    m = re.search(r"^(.*?)\s+(won|win|beat|beats)\b", str(result), re.I)
+    if not m:
+        return None
+    winner = _side(m.group(1), team_a, team_b)
+    if winner is None:
+        return None
+    return "Won" if winner == our_side else "Lost"
+
+
 def match_table(m_df):
     m = m_df.copy()
     m["match_id"] = m["match_id"].astype(str)
-    for c in ("date", "format", "team_a", "team_b"):
-        m[c] = m[c].fillna("").astype(str).str.strip()
+    for c in ("date", "format", "team_a", "team_b", "score_a", "score_b", "result", "our_team", "type"):
+        m[c] = m[c].fillna("").astype(str).str.strip() if c in m else ""
     m["date_dt"] = parse_dates(m["date"])
     m["format_label"] = m["format"].str.replace(r"\s+", " ", regex=True).replace("", NO_FORMAT)
-    ball = m["ball"] if "ball" in m else pd.Series("", index=m.index)
-    m["ball_label"] = ball.fillna("").astype(str).where(lambda b: b.isin(BALLS), NOT_SET)
+    col = lambda c: (m[c] if c in m else pd.Series("", index=m.index)).fillna("").astype(str).str.strip()
+    m["ball_label"] = col("ball").where(lambda b: b.isin(BALLS), NOT_SET)
+    m["venue_label"] = col("venue").where(lambda v: v.isin(VENUES), NOT_SET)
+
+    sides, opps, ours, theirs, outcomes = [], [], [], [], []
+    for r, opp, out in zip(m.to_dict("records"), col("opponent"), col("outcome")):
+        if r["type"] == "intra" or " & " in r["our_team"]:
+            side = "AB"
+        else:
+            side = _side(r["our_team"], r["team_a"], r["team_b"])
+        sides.append(side)
+        if side in ("A", "B"):
+            other = "B" if side == "A" else "A"
+            opps.append(opp or r[f"team_{other.lower()}"])
+            ours.append(r[f"score_{side.lower()}"])
+            theirs.append(r[f"score_{other.lower()}"])
+            outcomes.append(out if out in OUTCOMES else
+                            (guess_outcome(r["result"], r["team_a"], r["team_b"], side) or NOT_SET))
+        else:
+            opps.append(opp)
+            ours.append("")
+            theirs.append("")
+            outcomes.append(INTRA if side == "AB" else (out if out in OUTCOMES else NOT_SET))
+    m["our_side"], m["opponent_label"] = sides, opps
+    m["our_score"], m["opp_score"], m["outcome_label"] = ours, theirs, outcomes
     return m
 
 
@@ -227,9 +291,14 @@ def enrich(m_df, bat, bowl, field=None):
         df["date_dt"] = pd.to_datetime(dates)
         df["format_label"] = _lookup(df["match_id"], info["format_label"]).fillna(NO_FORMAT)
         df["ball_label"] = _lookup(df["match_id"], info["ball_label"]).fillna(NOT_SET)
+        df["venue_label"] = _lookup(df["match_id"], info["venue_label"]).fillna(NOT_SET)
         ta = _lookup(df["match_id"], info["team_a"]).fillna("")
         tb = _lookup(df["match_id"], info["team_b"]).fillna("")
         df["opponent"] = np.where(df["team"] == ta, tb, np.where(df["team"] == tb, ta, ""))
+        # your-team rows in a normal match use the cleaned-up opposition name
+        clean = _lookup(df["match_id"], info["opponent_label"]).fillna("")
+        normal = _lookup(df["match_id"], info["our_side"]).isin(["A", "B"])
+        df["opponent"] = np.where(normal & (clean != ""), clean, df["opponent"])
         return df
 
     field = (field.copy() if field is not None else pd.DataFrame(columns=FIELD_COLS)).reindex(columns=FIELD_COLS)
@@ -257,7 +326,7 @@ def enrich(m_df, bat, bowl, field=None):
 
 
 def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None,
-                balls=None):
+                balls=None, venues=None):
     out = df
     if date_range:
         lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
@@ -273,7 +342,69 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
         out = out[out["bowl_type"].isin(bowl_types)]
     if balls:
         out = out[out["ball_label"].isin(balls)]
+    if venues:
+        out = out[out["venue_label"].isin(venues)]
     return out
+
+
+# ---------------- team results ----------------
+def team_record(m):
+    """Played / won / lost ... for your team. Intra-squad games are left out.
+    Win % = won ÷ matches with a result (no-results don't count either way)."""
+    m = m[m["outcome_label"] != INTRA]
+    oc = m["outcome_label"]
+    rec = {k: int((oc == k).sum()) for k in OUTCOMES}
+    rec["Played"] = len(m)
+    rec["Not set"] = int((oc == NOT_SET).sum())
+    decided = rec["Played"] - rec["No result"] - rec["Not set"]
+    rec["Win %"] = round(rec["Won"] / decided * 100, 1) if decided else None
+    return rec
+
+
+def record_table(m, by, label):
+    """One row per value of `by` (opponent, venue, ball, format) with P / W / L / T / D / NR / Win %."""
+    m = m[m["outcome_label"] != INTRA]
+    rows = []
+    for key, g in m.groupby(by):
+        r = team_record(g)
+        last = g.sort_values("date_dt").iloc[-1]
+        rows.append({label: key or "—", "P": r["Played"], "W": r["Won"], "L": r["Lost"], "T": r["Tied"],
+                     "D": r["Drawn"], "NR": r["No result"], "Win %": r["Win %"],
+                     "Last result": last["outcome_label"]})
+    out = pd.DataFrame(rows, columns=[label, "P", "W", "L", "T", "D", "NR", "Win %", "Last result"])
+    out["Win %"] = pd.to_numeric(out["Win %"], errors="coerce")
+    return out.sort_values(["P", "Win %"], ascending=False, ignore_index=True)
+
+
+def name_clusters(names, threshold=0.8):
+    """Groups of names that are probably the same team (case/punctuation only, or close spellings)."""
+    by_key = {}
+    for n in names:
+        if str(n).strip():
+            by_key.setdefault(team_key(n), []).append(n)
+    reps = {v[0]: v for v in by_key.values()}
+    groups = []
+    for g in suggest_name_groups(list(reps), threshold):
+        groups.append(sorted({x for r in g for x in reps[r]}))
+    seen = {x for g in groups for x in g}
+    groups += [sorted(v) for v in by_key.values() if len(v) > 1 and not set(v) & seen]
+    return sorted(groups)
+
+
+def closest_name(name, known, threshold=0.8):
+    """The known name this one most likely means (or None)."""
+    k = team_key(name)
+    best, score = None, 0
+    for n in known:
+        kn = team_key(n)
+        if kn == k:
+            return n
+        s = difflib.SequenceMatcher(None, k, kn).ratio()
+        if kn and (re.search(rf"\b{re.escape(kn)}\b", k) or re.search(rf"\b{re.escape(k)}\b", kn)):
+            s = max(s, 0.9)
+        if s > score:
+            best, score = n, s
+    return best if score >= threshold else None
 
 
 def guess_type(name, types):
