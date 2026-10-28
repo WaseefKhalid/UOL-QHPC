@@ -16,6 +16,7 @@ from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CHOICES, guess_ball,
                    TOSSES, INNINGS, guess_toss, guess_innings, POINTS_RULES, match_points,
                    players_of_match, mvp_table, dismissal_breakdown, HOW_OUT_LABELS,
+                   resolve_name, clean_scorecard_name, GUEST,
                    overs_from_scorecard,
                    guess_outcome, closest_name, name_clusters, team_record, record_table,
                    guess_type, career_batting, career_bowling, batting_by_position, player_overview,
@@ -217,6 +218,81 @@ def match_details(fk, mt, side, labels, known_opps, known_formats):
     need = (["opponent", "venue", "outcome", "toss_result", "innings"] if normal else []) + ["format", "overs", "ball"]
     d["missing"] = [k for k in need if not d.get(k)]
     return d
+
+
+def _who_label(raw, roles):
+    return f"**{clean_scorecard_name(raw)}** · " + " · ".join(sorted(roles))
+
+
+def name_review(to_save):
+    """Match every one of our players' scorecard names to the squad list before saving.
+    Returns (names {scorecard: full}, remember {scorecard: (full, in squad)}, unanswered names)."""
+    roles = {}
+    for p, sides in to_save:
+        _m, b, w, f = db.rows_for(p, sides)
+        for kind, rows in (("batting", b), ("bowling", w), ("fielding", f)):
+            for r in rows:
+                roles.setdefault(r["player"], set()).add(kind)
+    if not roles:
+        return {}, {}, []
+    squad = db.squad_names()
+    with st.container(border=True):
+        h1, h2 = st.columns([4, 1], vertical_alignment="center")
+        h1.markdown(f"**Player names** — matched to your squad list ({len(squad)} players)")
+        if h2.button("🔄  Refresh", key="squad_refresh", help="Re-read the squad tab now (e.g. after adding "
+                                                              "a new admission)."):
+            db.clear_cache()
+            st.rerun()
+        if not squad:
+            st.caption("Your squad list is empty, so names are saved as the scorer wrote them. Add full names "
+                       "to the **squad** tab of your Google Sheet (column **Full name**) and press Refresh.")
+            return {}, {}, []
+        sp = db.spellings()
+        res = {n: resolve_name(n, squad, sp) for n in roles}
+        ask = [n for n in roles if res[n]["status"] == "ask"]
+        auto = [n for n in roles if res[n]["status"] != "ask"]
+        sig = short_hash("|".join(squad))
+        names, remember = {}, {}
+        if ask:
+            st.markdown(f"**Who is this?** — {len(ask)} name(s) need you")
+            for n in ask:
+                r = res[n]
+                opts = list(dict.fromkeys(r["options"] + squad)) + [GUEST]
+                idx = opts.index(r["default"]) if r.get("default") in opts else None
+                c1, c2 = st.columns([2, 3], vertical_alignment="center")
+                c1.markdown(_who_label(n, roles[n]))
+                c1.caption(r["reason"] + (" · last time you picked this" if idx is not None else ""))
+                pick = c2.selectbox(f"Who is {n}?", opts, index=idx, key=f"who_{short_hash(n)}_{sig}",
+                                    placeholder="Pick the player…", label_visibility="collapsed")
+                if pick == GUEST:
+                    names[n] = clean_scorecard_name(n)
+                    remember[n] = (names[n], False)
+                elif pick:
+                    names[n] = pick
+                    remember[n] = (pick, True)
+        if auto:
+            with st.expander(f"✅  {len(auto)} name(s) matched automatically — tap to check or change"):
+                df = pd.DataFrame({"Scorecard name": [clean_scorecard_name(n) for n in auto],
+                                   "Full name": [res[n]["full"] for n in auto],
+                                   "Why": [res[n]["reason"] for n in auto]})
+                opts = list(dict.fromkeys(squad + [f for f in df["Full name"] if f not in squad])) + [GUEST]
+                ed = st.data_editor(df, hide_index=True, width="stretch", disabled=["Scorecard name", "Why"],
+                                    key=f"auto_names_{sig}_{short_hash('|'.join(auto))}",
+                                    column_config={"Full name": st.column_config.SelectboxColumn(
+                                        "Full name", options=opts, required=True)})
+                for n, full in zip(auto, ed["Full name"]):
+                    if full == GUEST:
+                        names[n] = clean_scorecard_name(n)
+                        remember[n] = (names[n], False)
+                        continue
+                    names[n] = full
+                    if full != res[n]["full"] or res[n]["reason"] == "now in the squad list":
+                        remember[n] = (full, True)     # you corrected it, or a guest has joined the squad
+        missing = [n for n in ask if n not in names]
+        if missing:
+            st.warning(f"Pick who {len(missing)} name(s) are: " + ", ".join(clean_scorecard_name(n) for n in missing)
+                       + ". Choose “Not in squad list” for a guest or trialist.")
+    return names, remember, missing
 
 
 def name_details(bat_all, bowl_all):
@@ -593,6 +669,26 @@ def data_health():
     checks.append(("Bowling numbers to check", "fix",
                    "Re-upload the match from its PDF (Add matches → Replace the saved copy)", bad_bowl))
 
+    squad = db.squad_names()
+    if not squad:
+        checks.append(("Squad list is empty", "check", "Google Sheet → tab squad → column Full name",
+                       pd.DataFrame({"What to do": ["Add your players' full names so scorecard names can be "
+                                                    "matched automatically"]})))
+    else:
+        sp = db.spellings()
+        off = []
+        for p in players:
+            if p in squad:
+                continue
+            r = resolve_name(p, squad, sp)
+            if r["status"] == "remembered" and r["full"] == p:
+                continue
+            off.append({"Saved name": p, "Suggestion": r["full"] or ", ".join(r["options"][:2]) or "—"})
+        checks.append(("Player names not from the squad list", "fix", "🛠 Manage → Squad list — full names",
+                       pd.DataFrame(off, columns=["Saved name", "Suggestion"])))
+        checks.append(("Names typed twice in the squad list", "check", "Google Sheet → tab squad",
+                       pd.DataFrame({"Full name": db.squad_duplicates()})))
+
     untyped = sorted(set(bowl_all["player"]) - set(types))
     checks.append(("Bowlers without pace or spin", "fix", "🛠 Manage → Bowling types",
                    pd.DataFrame({"Bowler": untyped})))
@@ -790,9 +886,14 @@ if IS_ADMIN:
                 st.warning(f"Fill in the match details (opponent, venue, result, toss, innings, format, overs, "
                            f"ball) for {no_ball} match(es).")
 
+            # ---- scorecard names -> full names from the squad list
+            name_map, name_memory, names_missing = name_review(to_save) if to_save else ({}, {}, [])
+
             # ---- your bowlers with no bowling type yet: ask once per player, pace or spin
-            new_bowlers = sorted({r["player"] for p, sides in to_save for r in db.rows_for(p, sides)[2]
-                                  if r["player"] not in types})
+            new_bowlers = sorted({name_map.get(r["player"], r["player"])
+                                  for p, sides in to_save for r in db.rows_for(p, sides)[2]
+                                  if r["player"] not in names_missing      # asked once you've said who it is
+                                  and name_map.get(r["player"], r["player"]) not in types})
             bowl_choice = {}
             if new_bowlers:
                 with st.container(border=True):
@@ -813,13 +914,15 @@ if IS_ADMIN:
 
             label = f"✅  Save {len(to_save)} match(es)" + (f" — replacing {len(to_replace)}" if to_replace else "")
             if cards and st.button(label, type="primary",
-                                   disabled=bool(pending) or bool(no_ball) or bool(missing_types) or not to_save):
+                                   disabled=bool(pending) or bool(no_ball) or bool(missing_types)
+                                   or bool(names_missing) or not to_save):
                 with st.spinner(f"Saving {len(to_save)} match(es) to your sheet…"):
                     if bowl_choice:
                         db.set_bowling_types(bowl_choice)
                     for mid in to_replace:
                         db.delete_match(mid)
-                    nb, nw = db.append_many(to_save)
+                    nb, nw = db.append_many(to_save, names=name_map)
+                    db.save_spellings(name_memory)
                 skipped = len(cards) - len(to_save)
                 st.session_state["add_done"] = (
                     f"Saved {len(to_save)} match(es): {nb} batting and {nw} bowling entries for your team."
@@ -832,7 +935,8 @@ if IS_ADMIN:
                 st.caption("Nothing to save — every file is skipped.")
 
         with st.expander("Add a match by hand (fallback if a screenshot won't read)"):
-            st.caption("Enter your team's players only. Leave blanks as 0. Enter batters in batting order.")
+            st.caption("Enter your team's players only. Leave blanks as 0. Enter batters in batting order. "
+                       "Names that clearly match the squad list are saved with the full name.")
             mc1, mc2 = st.columns(2)
             ta = mc1.text_input("Your team", value=our_names[0] if our_names else "", key="m_ta")
             sa = mc2.text_input("Your score", key="m_sa", placeholder="e.g. 190-6 in 25.0 overs")
@@ -919,9 +1023,15 @@ if IS_ADMIN:
                 elif no_type:
                     st.warning(f"Pick pace or spin for new bowler(s): {', '.join(no_type)}.")
                 else:
+                    squad, sp = db.squad_names(), db.spellings()
+                    manual_names = {}
+                    for row in p["batting"] + p["bowling"]:
+                        r = resolve_name(row["player"], squad, sp) if squad else {"status": "ask"}
+                        if r["status"] != "ask":
+                            manual_names[row["player"]] = r["full"]
                     if typed_types:
-                        db.set_bowling_types(typed_types)
-                    nb, nbw = db.append_match(p, {"A"})
+                        db.set_bowling_types({manual_names.get(k, k): v for k, v in typed_types.items()})
+                    nb, nbw = db.append_match(p, {"A"}, names=manual_names)
                     st.session_state["add_done"] = f"Saved {nb} batting and {nbw} bowling entries."
                     st.rerun()
 
@@ -1571,6 +1681,58 @@ def similar_names(players, bat_all, bowl_all):
 
 
 @st.fragment
+def squad_section(players):
+    st.subheader("Squad list — full names")
+    st.caption("Your squad list lives in your Google Sheet: tab **squad**, column **Full name**, one player per "
+               "row. Add new admissions there — the app reads it within 2 minutes, or press Refresh.")
+    flash("squad_done")
+    squad, sp = db.squad_names(), db.spellings()
+    c1, c2 = st.columns([3, 1], vertical_alignment="center")
+    c1.markdown(f"**{len(squad)}** players in the squad list · **{len(sp)}** remembered spellings "
+                "(tab **spellings** — you can edit them there)")
+    if c2.button("🔄  Refresh", key="squad_refresh_m"):
+        db.clear_cache()
+        st.rerun()
+    if not squad:
+        st.info("The squad tab is empty. Add your players' full names to it, then press Refresh.")
+        return
+    todo = []
+    for p in players:
+        if p in squad:
+            continue
+        r = resolve_name(p, squad, sp)
+        if r["status"] == "remembered" and r["full"] == p:       # a guest you've already marked
+            continue
+        todo.append((p, r))
+    if not todo:
+        st.success("Every saved player name is a full name from the squad list 👍")
+        return
+    st.markdown(f"**{len(todo)} saved name(s) aren't from the squad list yet.** Pick the right player, "
+                "then press Apply — all their stats move to the full name.")
+    sig = short_hash("|".join(squad))
+    picks = {}
+    for p, r in todo:
+        opts = list(dict.fromkeys(r["options"] + squad)) + [GUEST]
+        pre = r["full"] if r["status"] != "ask" else r.get("default")
+        a, b = st.columns([2, 3], vertical_alignment="center")
+        a.markdown(f"**{p}**")
+        a.caption(r["reason"])
+        picks[p] = b.selectbox(f"Full name for {p}", opts, index=opts.index(pre) if pre in opts else None,
+                               key=f"link_{short_hash(p)}_{sig}", placeholder="Pick the player…",
+                               label_visibility="collapsed")
+    chosen = {p: v for p, v in picks.items() if v}
+    if st.button(f"✅  Apply {len(chosen)} name(s)", type="primary", disabled=not chosen, key="link_apply"):
+        pairs = {p: v for p, v in chosen.items() if v != GUEST}
+        remember = {p: ((v, True) if v != GUEST else (p, False)) for p, v in chosen.items()}
+        with st.spinner("Updating saved matches…"):
+            db.relink_names(pairs, remember)
+        st.session_state["squad_done"] = (f"Linked {len(pairs)} name(s) to the squad list"
+                                          + (f" and marked {len(chosen) - len(pairs)} as guests" if len(chosen) > len(pairs) else "")
+                                          + ".")
+        st.rerun()
+
+
+@st.fragment
 def opponent_names(matches):
     st.subheader("Opposition names")
     st.caption("Keep one name per team so head-to-head records stay together. Renaming updates "
@@ -1681,6 +1843,8 @@ def merge_full_list(players, bat_all, bowl_all):
 
 if IS_ADMIN:
     with TABS["manage"]:
+        squad_section(players)
+        st.divider()
         duplicate_scan(matches, bat_all, bowl_all)
         st.divider()
         opponent_names(matches)
