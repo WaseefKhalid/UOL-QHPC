@@ -70,7 +70,8 @@ def _retry(fn, *args, **kwargs):
     """Call a gspread function, backing off and retrying on rate limits (429) and brief Google outages (5xx)."""
     import gspread
     last = None
-    for i in range(6):
+    waits = [3, 6, 12, 20, 30]          # ~70 s in total: Google's read/write quota resets each minute
+    for i in range(len(waits) + 1):
         try:
             return fn(*args, **kwargs)
         except gspread.exceptions.APIError as e:
@@ -80,8 +81,8 @@ def _retry(fn, *args, **kwargs):
                 status = e.response.status_code
             except Exception:
                 pass
-            if status in (429, 500, 502, 503):
-                time.sleep(2 * (i + 1))
+            if status in (429, 500, 502, 503) and i < len(waits):
+                time.sleep(waits[i])
                 continue
             raise
     if last:
@@ -417,42 +418,42 @@ def keep_only_teams(teams):
     return removed
 
 
-def merge_players(variants, canonical):
-    bat = load("batting")
-    if not bat.empty:
-        for col in ("player", "bowler", "fielder"):
-            bat[col] = bat[col].replace(variants, canonical)
-        _overwrite("batting", bat)
-    bowl = load("bowling")
-    if not bowl.empty:
-        bowl["player"] = bowl["player"].replace(variants, canonical)
-        _overwrite("bowling", bowl)
-    field = load("fielding")
-    if not field.empty and field["player"].isin(variants).any():
-        field["player"] = field["player"].replace(variants, canonical)
-        _overwrite("fielding", field)
+def rename_many(mapping):
+    """Rename several players in one go: {old name: new name}. Reads and writes each tab once
+    (renaming one player at a time used too many Google Sheets calls and hit the per-minute limit).
+    Returns how many entries changed."""
+    mapping = {str(o): str(n) for o, n in mapping.items() if str(o).strip() and str(n).strip() and o != n}
+    if not mapping:
+        return 0
+    changed = 0
+    for name, cols in (("batting", ("player", "bowler", "fielder")), ("bowling", ("player",)),
+                       ("fielding", ("player",))):
+        df = load(name)
+        if df.empty:
+            continue
+        hits = int(df[list(cols)].isin(list(mapping)).to_numpy().sum())
+        if hits:
+            for col in cols:
+                df[col] = df[col].replace(mapping)
+            _overwrite(name, df)
+            changed += hits
     types = bowling_types()
-    if any(v in types for v in variants):
-        keep = types.get(canonical) or next((types[v] for v in variants if types.get(v)), "")
-        for v in variants:
-            types.pop(v, None)
-        if keep:
-            types[canonical] = keep
+    if any(o in types for o in mapping):
+        for old, new in mapping.items():
+            if old in types:
+                types.setdefault(new, types[old])
+                types.pop(old)
         _save_types(types)
     clear_cache()
+    return changed
+
+
+def merge_players(variants, canonical):
+    rename_many({v: canonical for v in variants if v != canonical})
 
 
 def rename_player(variants, canonical):
-    targets = [v for v in variants if v != canonical]
-    bat, bowl = load("batting"), load("bowling")
-    n = 0
-    if not bat.empty:
-        n += int(bat[["player", "bowler", "fielder"]].isin(targets).to_numpy().sum())
-    if not bowl.empty:
-        n += int(bowl[["player"]].isin(targets).to_numpy().sum())
-    n += int(load("fielding")["player"].isin(targets).sum())
-    merge_players(variants, canonical)
-    return n
+    return rename_many({v: canonical for v in variants if v != canonical})
 
 
 # ---------------- "not the same player" memory ----------------
@@ -539,11 +540,25 @@ def save_spellings(updates):
     _overwrite("spellings", out)
 
 
-def relink_names(pairs, remember=None):
-    """Rename saved players to their squad-list full names: {saved name: full name}."""
-    for raw, full in pairs.items():
-        if raw != full:
-            rename_player([raw, full], full)
+def add_to_squad(names):
+    """Add new players to the squad tab (names already there, in any case, are skipped)."""
+    have = {n.lower() for n in squad_names()}
+    new = []
+    for n in names:
+        n = " ".join(str(n).split())
+        if n and n.lower() not in have:
+            have.add(n.lower())
+            new.append({"Full name": n})
+    _append("squad", new)
+    clear_cache()
+    return len(new)
+
+
+def relink_names(pairs, remember=None, new_players=()):
+    """Rename saved players to their squad-list full names in one pass: {saved name: full name}.
+    new_players are typed full names to add to the squad tab first."""
+    add_to_squad(new_players)
+    rename_many(pairs)
     save_spellings(remember or {})
     clear_cache()
 
