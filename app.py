@@ -1,4 +1,5 @@
 import io
+import re
 import time
 import hmac
 import hashlib
@@ -61,6 +62,18 @@ def _logout():
 if not ADMIN_PASSWORD and not db.use_sheets():
     st.session_state.is_admin = True
 IS_ADMIN = bool(st.session_state.get("is_admin"))
+
+
+# ---------------- phone or computer? ----------------
+def _is_mobile():
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return bool(re.search(r"Mobi|Android|iPhone|iPod", ua))
+
+
+IS_MOBILE = _is_mobile()
 
 
 # ---------------- helpers ----------------
@@ -447,6 +460,48 @@ def build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts):
             "footer_right": f"As of {dt.date.today():%d %b %Y}"}
 
 
+@st.cache_data(show_spinner=False)
+def list_png_cached(payload):
+    import json
+    a = json.loads(payload)
+    return ui.list_png(a["title"], a["subtitle"], [tuple(r) for r in a["rows"]], a["scope"], a["footer_right"])
+
+
+def graphic_download(title, subtitle, rows, key, label="⬇️  Download graphic (PNG)"):
+    """A download button for a branded PNG of a ranked list (same filters as the page)."""
+    import json
+    payload = json.dumps({"title": title, "subtitle": subtitle,
+                          "rows": [[str(n), str(v), str(d)] for n, v, d in rows],
+                          "scope": FILTER_NOTE or f"All matches from {ui.STATS_FROM}",
+                          "footer_right": f"As of {dt.date.today():%d %b %Y}"})
+    slug = "-".join(title.lower().split())
+    st.download_button(label, list_png_cached(payload), file_name=f"UOL-QHPC-{slug}.png", mime="image/png",
+                       key=key, disabled=not rows, width="stretch")
+
+
+REC_MOBILE = ["P", "W", "L", "Win %"]
+
+
+def show_table(df, key, mobile_cols=None, top=0, result_col=None, max_height=None, column_config=None):
+    """A styled table. On phones, only the key columns show at first (a toggle shows the rest),
+    and the player / opponent column stays pinned while scrolling sideways."""
+    df = df.reset_index(drop=True)
+    if IS_MOBILE and mobile_cols:
+        keep = [c for c in mobile_cols if c in df.columns]
+        if 0 < len(keep) < len(df.columns) and not st.toggle("Show all columns", key=f"cols_{key}"):
+            df = df[keep]
+    cfg = dict(column_config or {})
+    for name in ("Player", "Opponent"):
+        if name in df.columns and name not in cfg:
+            cfg[name] = st.column_config.Column(name, pinned=True)
+            break
+    if "#" in df.columns and "#" not in cfg:
+        cfg["#"] = st.column_config.NumberColumn("#", width="small", pinned=True)
+    kw = {"height": min(38 + 35 * len(df), max_height)} if max_height else {}
+    st.dataframe(ui.styled(df, top=top, result_col=result_col), hide_index=True, width="stretch",
+                 column_config=cfg, **kw)
+
+
 def show_filter_note(batting=True):
     if FILTER_NOTE:
         ui.note(FILTER_NOTE)
@@ -456,6 +511,8 @@ def show_filter_note(batting=True):
 
 
 ui.masthead(len(matches), len(players), matches["date_dt"].max() if not matches.empty else None)
+if IS_MOBILE:
+    ui.note("Filters: tap » at the top left" + (f" · {FILTER_NOTE}" if FILTER_NOTE else ""))
 # ---------------- Data health (admin) ----------------
 def data_health():
     """Every check returns (title, kind, where_to_fix, rows). kind: 'fix' (wrong or missing)
@@ -901,10 +958,11 @@ def render_profile(name, bat_f, field_f, bowl_f):
             st.caption("No batting innings under the current filters.")
             return
         r = career_batting(pb, fielding=field_f).iloc[0]
-        for col, (lbl, v) in zip(st.columns(8), [
-                ("Inns", r["Inns"]), ("Runs", r["Runs"]), ("HS", r["HS"]), ("Avg", dash(r["Avg"])),
-                ("SR", dash(r["SR"])), ("50s", r["50s"]), ("100s", r["100s"]), ("Catches", r["Catches"])]):
-            col.metric(lbl, v)
+        ui.cards([(lbl, v, "") for lbl, v in [
+            ("Innings", r["Inns"]), ("Runs", r["Runs"]), ("Highest", r["HS"]),
+            ("Average", "—" if pd.isna(r["Avg"]) else f"{r['Avg']:.2f}"),
+            ("Strike rate", "—" if pd.isna(r["SR"]) else f"{r['SR']:.2f}"),
+            ("50s", r["50s"]), ("100s", r["100s"]), ("Catches", r["Catches"])]], small=True)
         fd = field_f.loc[field_f["player"] == name, "dismissal"].value_counts()
         if fd.sum():
             st.caption("Fielding: " + " · ".join(
@@ -920,6 +978,7 @@ def render_profile(name, bat_f, field_f, bowl_f):
                        + (f", not out {not_outs}" if not_outs else "")
                        + f" — most often {top_how['How out'].lower()} ({int(top_how['Times'])}, "
                          f"{top_how['% of dismissals']:.0f}%).")
+            st.write("")   # room for the table's toolbar
             hl, hr = st.columns([2, 3])
             hl.dataframe(ui.styled(how.assign(**{"% of dismissals": how["% of dismissals"].astype(int).astype(str) + "%"})),
                          hide_index=True, width="stretch")
@@ -942,30 +1001,30 @@ def render_profile(name, bat_f, field_f, bowl_f):
             st.bar_chart(form, height=220, x_label="Innings", y_label="Runs")
         st.markdown("**Match by match**")
         mbm = pb.sort_values("date_dt", ascending=False, na_position="last")
-        st.dataframe(ui.styled(pd.DataFrame({
+        show_table(pd.DataFrame({
             "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
             "Format": mbm["format_label"], "Pos": mbm["position"],
             "How out": mbm["how_out"].map(lambda h: "Not out" if h == "not out" else HOW_OUT_LABELS.get(h, "—")),
             "R": mbm["runs"], "B": mbm["balls"],
-            "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]})),
-            hide_index=True, width="stretch")
+            "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]}), f"mbm_bat_{short_hash(name)}",
+            mobile_cols=["Date", "Vs", "R", "B", "SR"])
     else:
         if pw.empty:
             st.caption("No bowling innings under the current filters.")
             return
         r = career_bowling(pw).iloc[0]
         st.caption(f"Bowling type: **{r['Type']}**")
-        for col, (lbl, v) in zip(st.columns(7), [
-                ("Inns", r["Inns"]), ("Overs", r["Overs"]), ("Wkts", r["Wkts"]), ("Best", r["Best"]),
-                ("Avg", dash(r["Avg"])), ("Econ", dash(r["Econ"])), ("3W+", r["3W+"])]):
-            col.metric(lbl, v)
+        ui.cards([(lbl, v, "") for lbl, v in [
+            ("Innings", r["Inns"]), ("Overs", f"{r['Overs']:g}"), ("Wickets", r["Wkts"]), ("Best", r["Best"]),
+            ("Average", "—" if pd.isna(r["Avg"]) else f"{r['Avg']:.2f}"),
+            ("Economy", "—" if pd.isna(r["Econ"]) else f"{r['Econ']:.2f}"), ("3W+", r["3W+"])]], small=True)
         st.markdown("**Match by match**")
         mbm = pw.sort_values("date_dt", ascending=False, na_position="last")
-        st.dataframe(ui.styled(pd.DataFrame({
+        show_table(pd.DataFrame({
             "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
             "Format": mbm["format_label"], "O": mbm["overs"], "M": mbm["maidens"], "R": mbm["runs"], "W": mbm["wickets"],
-            "Econ": mbm["econ"], "Wd": mbm["wides"], "NB": mbm["no_balls"]})),
-            hide_index=True, width="stretch")
+            "Econ": mbm["econ"], "Wd": mbm["wides"], "NB": mbm["no_balls"]}), f"mbm_bowl_{short_hash(name)}",
+            mobile_cols=["Date", "Vs", "O", "R", "W"])
 
 
 def compare_table(names, bat_f, field_f, bowl_f):
@@ -1015,8 +1074,8 @@ def player_search(bat_f, field_f, bowl_f, players):
         found = pd.concat([found, pd.DataFrame({"Player": missing, "Matches": 0})], ignore_index=True)
     if fuzzy:
         found = found.set_index("Player").loc[names].reset_index()
-    st.dataframe(ui.styled(found), hide_index=True, width="stretch", height=min(38 + 35 * len(found), 320),
-                 column_config={"Teams": st.column_config.TextColumn(width="medium")})
+    show_table(found, "ps_found", max_height=320, mobile_cols=["Player", "Matches", "Runs", "Wkts"],
+               column_config={"Teams": st.column_config.TextColumn(width="medium")})
 
     pick_list = found["Player"].tolist()
     pick = pick_list[0] if len(pick_list) == 1 else st.selectbox(
@@ -1096,9 +1155,9 @@ def leaderboards(bat_f, field_f, bowl_f):
         return
     table = table.reset_index(drop=True)
     table.insert(0, "#", range(1, len(table) + 1))
-    st.dataframe(ui.styled(table, top=0 if q.strip() else 3), hide_index=True, width="stretch",
-                 height=min(38 + 35 * len(table), 640),
-                 column_config={"#": st.column_config.NumberColumn("#", width="small")})
+    show_table(table, "lb_" + which, top=0 if q.strip() else 3, max_height=640,
+               mobile_cols=(["#", "Player", "Runs", "Avg", "SR"] if which == "Batting"
+                            else ["#", "Player", "Wkts", "Avg", "Econ"]))
     st.caption(f"{len(table)} player(s) · ranked by {'runs' if which == 'Batting' else 'wickets'}. "
                "Click a column header to sort.")
 
@@ -1111,6 +1170,10 @@ def _when(r):
     parts = [f"vs {r['opponent']}" if r["opponent"] else "", f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "",
              r["format_label"] if r["format_label"] != NO_FORMAT else ""]
     return " · ".join(p for p in parts if p)
+
+
+MIN_INNS_FOR_AVG = 3     # innings needed to appear in "Best batting average"
+MIN_WKTS_FOR_AVG = 3     # wickets needed to appear in "Best bowling average"
 
 
 @st.fragment
@@ -1133,14 +1196,31 @@ def top_performers(bat_f, bowl_f):
     spells = bowl_f[bowl_f["wickets"] > 0].sort_values(["wickets", "runs"], ascending=[False, True]).head(n)
     best_figs = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
                   f"{r['overs']:g} ov · {_when(r)}") for _, r in spells.iterrows()]
+    q_bat = cb[(cb["Inns"] >= MIN_INNS_FOR_AVG) & cb["Avg"].notna()]
+    bat_avg = [(r["Player"], f"{r['Avg']:.2f}", f"{r['Inns']} inns · {r['Runs']} runs · SR {_num(r['SR'])}")
+               for _, r in q_bat.sort_values(["Avg", "Runs"], ascending=False).head(n).iterrows()]
+    q_bowl = cw[(cw["Wkts"] >= MIN_WKTS_FOR_AVG) & cw["Avg"].notna()]
+    bowl_avg = [(r["Player"], f"{r['Avg']:.2f}", f"{r['Wkts']} wkts · {r['Overs']:g} ov · econ {_num(r['Econ'])}")
+                for _, r in q_bowl.sort_values(["Avg", "Wkts"], ascending=[True, False]).head(n).iterrows()]
 
-    for left, right in ((("Most runs", "Batting", most_runs), ("Highest scores", "Single innings", best_scores)),
-                        (("Most wickets", "Bowling", most_wkts), ("Best bowling figures", "Single innings", best_figs))):
-        c1, c2 = st.columns(2, gap="medium")
-        with c1:
-            ui.top_list(*left)
-        with c2:
-            ui.top_list(*right)
+    st.caption("Each list has a download button for a ready-to-share graphic.")
+    lists = [
+        ("Most runs", "Batting", most_runs, "Batting"),
+        ("Highest scores", "Single innings", best_scores, "Highest single-innings scores"),
+        ("Best batting average", f"Min {MIN_INNS_FOR_AVG} innings", bat_avg,
+         f"Batting average · min {MIN_INNS_FOR_AVG} innings"),
+        ("Most wickets", "Bowling", most_wkts, "Bowling"),
+        ("Best bowling figures", "Single innings", best_figs, "Best figures in an innings"),
+        ("Best bowling average", f"Min {MIN_WKTS_FOR_AVG} wickets", bowl_avg,
+         f"Bowling average · min {MIN_WKTS_FOR_AVG} wickets"),
+    ]
+    for pair in ([lists[0], lists[1]], [lists[3], lists[4]], [lists[2], lists[5]]):
+        cols = st.columns(2, gap="medium")
+        for col, (title, sub, rows, gsub) in zip(cols, pair):
+            with col:
+                ui.top_list(title, sub, rows)
+                graphic_download(title, f"Top {len(rows)} · {gsub}", rows, key=f"tp_dl_{short_hash(title)}")
+                st.write("")
 
 
 with TABS["top"]:
@@ -1170,15 +1250,21 @@ def mvp_tab(bat_f, bowl_f, field_f):
     min_m = c1.number_input("Min. matches", min_value=1, value=1, step=1, key="mvp_min")
     q = c2.text_input("Find player", key="mvp_q", placeholder="Filter the table by name")
     t = table[table["Matches"] >= min_m]
+    top10 = t.head(10)
+    graphic_download("MVP rankings", f"Top {len(top10)} · Points for batting, bowling and fielding",
+                     [(r["Player"], int(r["Total"]),
+                       f"{r['Matches']} match(es) · Bat {r['Batting']} · Bowl {r['Bowling']} · Field {r['Fielding']}"
+                       + (f" · POTM {r['POTM']}" if r["POTM"] else ""))
+                      for _, r in top10.iterrows()],
+                     key="mvp_dl", label="⬇️  Download MVP top 10 (PNG)")
     if q.strip():
         t = t[t["Player"].str.contains(q.strip(), case=False, regex=False)]
     t = t.reset_index(drop=True)
     t.insert(0, "#", range(1, len(t) + 1))
-    st.dataframe(ui.styled(t, top=0 if q.strip() else 3), hide_index=True, width="stretch",
-                 height=min(38 + 35 * len(t), 640),
-                 column_config={"#": st.column_config.NumberColumn("#", width="small"),
-                                "POTM": st.column_config.NumberColumn("POTM", help="Player of the Match awards"),
-                                "Best": st.column_config.NumberColumn("Best", help="Most points in one match")})
+    show_table(t, "mvp", top=0 if q.strip() else 3, max_height=640,
+               mobile_cols=["#", "Player", "Total", "Per match", "POTM"],
+               column_config={"POTM": st.column_config.NumberColumn("POTM", help="Player of the Match awards"),
+                              "Best": st.column_config.NumberColumn("Best", help="Most points in one match")})
     with st.expander("How points work"):
         for group, rules in POINTS_RULES:
             st.markdown(f"**{group}**")
@@ -1188,10 +1274,10 @@ def mvp_tab(bat_f, bowl_f, field_f):
                    "a ball type, home or away, or a date range.")
 
     ui.section("01", "Player of the Match")
-    st.dataframe(ui.styled(pd.DataFrame({
+    show_table(pd.DataFrame({
         "Date": fmt_date(potm["date_dt"]), "Opponent": potm["opponent"].replace("", "—"),
-        "Player": potm["player"], "Performance": potm["performance"], "Points": potm["total"]})),
-        hide_index=True, width="stretch")
+        "Player": potm["player"], "Performance": potm["performance"], "Points": potm["total"]}), "potm",
+        mobile_cols=["Date", "Player", "Performance", "Points"])
 
 
 with TABS["mvp"]:
@@ -1228,8 +1314,8 @@ def team_analysis(m):
 
     ui.section("01", "Head to head")
     st.caption("Your record against each team.")
-    st.dataframe(ui.styled(record_table(games, "opponent_label", "Opponent"), result_col="Last result"),
-                 hide_index=True, width="stretch")
+    show_table(record_table(games, "opponent_label", "Opponent"), "h2h", result_col="Last result",
+               mobile_cols=["Opponent"] + REC_MOBILE)
 
     ui.section("02", "Toss · batting first vs chasing")
     known_inn = games[games["innings_label"] != NOT_SET]
@@ -1244,34 +1330,39 @@ def team_analysis(m):
                        f"{int(games['toss_label'].isin(TOSSES).sum())}", ""),
     ])
     c1, c2 = st.columns(2, gap="medium")
-    c1.dataframe(ui.styled(record_table(games, "innings_label", "Our innings").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
-    c2.dataframe(ui.styled(record_table(games, "toss_label", "Toss").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
-    st.dataframe(ui.styled(record_table(games, "toss_innings", "Toss and decision").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
+    with c1:
+        show_table(record_table(games, "innings_label", "Our innings").drop(columns=["Last result"]), "rec_innings_label",
+                   mobile_cols=["Our innings"] + REC_MOBILE)
+    with c2:
+        show_table(record_table(games, "toss_label", "Toss").drop(columns=["Last result"]), "rec_toss_label",
+                   mobile_cols=["Toss"] + REC_MOBILE)
+    show_table(record_table(games, "toss_innings", "Toss and decision").drop(columns=["Last result"]), "rec_toss_innings",
+               mobile_cols=["Toss and decision"] + REC_MOBILE)
     unknown = int(((games["toss_label"] == NOT_SET) | (games["innings_label"] == NOT_SET)).sum())
     if unknown:
         st.caption(f"{unknown} match(es) have no toss or innings recorded — set them in the 📋 Matches tab.")
 
     ui.section("03", "Home and away · white and red ball")
     c1, c2 = st.columns(2, gap="medium")
-    c1.dataframe(ui.styled(record_table(games, "venue_label", "Venue").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
-    c2.dataframe(ui.styled(record_table(games, "ball_label", "Ball").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
+    with c1:
+        show_table(record_table(games, "venue_label", "Venue").drop(columns=["Last result"]), "rec_venue_label",
+                   mobile_cols=["Venue"] + REC_MOBILE)
+    with c2:
+        show_table(record_table(games, "ball_label", "Ball").drop(columns=["Last result"]), "rec_ball_label",
+                   mobile_cols=["Ball"] + REC_MOBILE)
 
     ui.section("04", "By match format")
-    st.dataframe(ui.styled(record_table(games, "format_label", "Format").drop(columns=["Last result"])),
-                 hide_index=True, width="stretch")
+    show_table(record_table(games, "format_label", "Format").drop(columns=["Last result"]), "rec_format_label",
+               mobile_cols=["Format"] + REC_MOBILE)
 
     ui.section("05", "All results")
     allr = games.sort_values("date_dt", ascending=False, na_position="last")
-    st.dataframe(ui.styled(pd.DataFrame({
+    show_table(pd.DataFrame({
         "Date": fmt_date(allr["date_dt"]), "Opponent": allr["opponent_label"], "Venue": allr["venue_label"],
-        "Toss": allr["toss_label"], "Innings": allr["innings_label"], "Format": allr["format_label"], "Ball": allr["ball_label"], "Us": allr["our_score"],
-        "Them": allr["opp_score"], "Result": allr["outcome_label"], "Margin": allr["result"]}),
-        result_col="Result"), hide_index=True, width="stretch")
+        "Toss": allr["toss_label"], "Innings": allr["innings_label"], "Format": allr["format_label"],
+        "Ball": allr["ball_label"], "Us": allr["our_score"], "Them": allr["opp_score"],
+        "Result": allr["outcome_label"], "Margin": allr["result"]}), "all_results", result_col="Result",
+        mobile_cols=["Date", "Opponent", "Result"])
 
 
 with TABS["team"]:
