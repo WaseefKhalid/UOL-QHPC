@@ -167,6 +167,7 @@ def parse_stumps_pdf(file_like):
             if row:
                 bowling.append(row)
 
+    meta["bat_first"] = batting[0]["team"] if batting else ""   # scorecard order = innings order
     return {"meta": meta, "batting": batting, "bowling": bowling}
 
 
@@ -249,5 +250,6 @@ def parse_summary_image(file_like):
                 "wides": 0, "no_balls": 0})
 
     meta = {"match_id": match_id, "date": "", "format": "", "overs": "", "result": result,
-            "toss": "", "team_a": team_a, "team_b": team_b, "score_a": score_a, "score_b": score_b}
+            "toss": "", "team_a": team_a, "team_b": team_b, "score_a": score_a, "score_b": score_b,
+            "bat_first": ""}
     return {"meta": meta, "batting": batting, "bowling": bowling}
