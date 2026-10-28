@@ -84,6 +84,8 @@ def career_batting(bat, fielding=None):
         rows.append(row)
     cols = BAT_COLS[:1] + (["Pos"] if has_pos else []) + BAT_COLS[1:]
     out = pd.DataFrame(rows, columns=cols).sort_values("Runs", ascending=False, ignore_index=True)
+    for c in ("Avg", "SR"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     if has_pos:
         out["Pos"] = out["Pos"].astype("Int64")
     return out
@@ -112,8 +114,10 @@ def career_bowling(bowl):
             "Wd": int(g["wides"].sum()), "NB": int(g["no_balls"].sum()),
             **({"Type": g["bowl_type"].iloc[0]} if has_type else {}),
         })
-    return pd.DataFrame(rows, columns=cols).sort_values(["Wkts", "Avg"], ascending=[False, True],
-                                                             ignore_index=True)
+    out = pd.DataFrame(rows, columns=cols)
+    for c in ("Avg", "Econ"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out.sort_values(["Wkts", "Avg"], ascending=[False, True], ignore_index=True)
 
 
 def batting_by_position(bat):
@@ -125,7 +129,10 @@ def batting_by_position(bat):
         runs, balls = int(g["runs"].sum()), int(g["balls"].sum())
         rows.append({"Pos": int(pos), "Inns": inns, "Runs": runs, "HS": int(g["runs"].max()),
                      "Avg": _avg(runs, inns - no), "SR": _sr(runs, balls)})
-    return pd.DataFrame(rows, columns=["Pos", "Inns", "Runs", "HS", "Avg", "SR"])
+    out = pd.DataFrame(rows, columns=["Pos", "Inns", "Runs", "HS", "Avg", "SR"])
+    for c in ("Avg", "SR"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
 
 
 def player_overview(bat, bowl, fielding=None):
