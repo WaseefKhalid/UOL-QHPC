@@ -15,10 +15,10 @@ LOGO = os.path.join(os.path.dirname(__file__), "assets", "logo.png")  # optional
 
 CSS = f"""
 <style>
-.block-container {{ padding-top: 2.2rem; padding-bottom: 1rem; max-width: 1440px; }}
+.block-container {{ padding-top: 4.2rem; padding-bottom: 1rem; max-width: 1440px; }}
 #MainMenu, footer {{ visibility: hidden; }}
 @media (max-width: 640px) {{
-  .block-container {{ padding-top: 3.4rem; }}
+  .block-container {{ padding-top: 4.4rem; }}
   .qh-title {{ font-size: 1.7rem; }}
   .qh-meta {{ text-align: left; }}
 }}
@@ -75,6 +75,31 @@ CSS = f"""
 /* profile header */
 .qh-chip {{ display: inline-block; background: {TINT}; color: {MID}; border-radius: 999px;
            font-size: .76rem; font-weight: 600; padding: 2px 10px; margin: 0 6px 6px 0; }}
+
+/* top performers */
+.qh-top {{ border: 1px solid {LINE}; border-radius: 10px; overflow: hidden; margin-bottom: 18px; background: #fff; }}
+.qh-top-h {{ background: {DEEP}; color: #fff; padding: 10px 16px; display: flex; justify-content: space-between;
+            align-items: baseline; gap: 10px; }}
+.qh-top-h .t {{ font-family: "Source Serif Pro", Georgia, serif; font-size: 1.15rem; font-weight: 700; }}
+.qh-top-h .s {{ font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: #8FD4B0; font-weight: 700; }}
+.qh-hero {{ display: flex; align-items: center; gap: 14px; padding: 16px; background: {TINT};
+           border-bottom: 1px solid {LINE}; }}
+.qh-hero .rk {{ flex: none; width: 34px; height: 34px; border-radius: 50%; background: {BRIGHT}; color: #fff;
+               font-weight: 800; display: flex; align-items: center; justify-content: center; }}
+.qh-hero .who {{ flex: 1; min-width: 0; }}
+.qh-hero .nm {{ font-size: 1.12rem; font-weight: 700; color: {DEEP}; white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; }}
+.qh-hero .dt {{ font-size: .8rem; color: #4A5A52; }}
+.qh-hero .vl {{ flex: none; font-size: 2.3rem; font-weight: 800; color: {DEEP}; line-height: 1; }}
+.qh-row {{ display: flex; align-items: center; gap: 12px; padding: 9px 16px; border-bottom: 1px solid #EEF5F1; }}
+.qh-row:nth-child(even) {{ background: {PALE}; }}
+.qh-row:last-child {{ border-bottom: none; }}
+.qh-row .rk {{ flex: none; width: 24px; color: {MID}; font-weight: 700; text-align: center; }}
+.qh-row .who {{ flex: 1; min-width: 0; }}
+.qh-row .nm {{ font-weight: 600; color: {INK}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.qh-row .dt {{ font-size: .76rem; color: {MUTED}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.qh-row .vl {{ flex: none; font-weight: 700; color: {DEEP}; font-size: 1.05rem; }}
+.qh-empty {{ padding: 18px 16px; color: {MUTED}; font-size: .9rem; }}
 
 /* footer */
 .qh-foot {{ border-top: 1px solid {LINE}; margin-top: 32px; padding-top: 10px; color: #7A8A82;
@@ -155,6 +180,22 @@ def footer(updated=None):
         right += f" · Updated {updated:%d %b %Y}"
     st.markdown(f'<div class="qh-foot"><span>{esc(ORG)} · Performance Analysis</span>'
                 f'<span>{esc(right)}</span></div>', unsafe_allow_html=True)
+
+
+def top_list(title, subtitle, rows):
+    """A ranked card: #1 large, the rest as a list. rows: list of (name, value, detail)."""
+    if not rows:
+        body = '<div class="qh-empty">No data in the current filters.</div>'
+    else:
+        n, v, d = rows[0]
+        body = (f'<div class="qh-hero"><div class="rk">1</div><div class="who"><div class="nm">{esc(n)}</div>'
+                f'<div class="dt">{esc(d)}</div></div><div class="vl">{esc(v)}</div></div>')
+        body += "".join(
+            f'<div class="qh-row"><span class="rk">{i}</span><span class="who"><div class="nm">{esc(n)}</div>'
+            f'<div class="dt">{esc(d)}</div></span><span class="vl">{esc(v)}</span></div>'
+            for i, (n, v, d) in enumerate(rows[1:], start=2))
+    st.markdown(f'<div class="qh-top"><div class="qh-top-h"><span class="t">{esc(title)}</span>'
+                f'<span class="s">{esc(subtitle)}</span></div>{body}</div>', unsafe_allow_html=True)
 
 
 DECIMALS = ("Avg", "SR", "Econ", "Bat avg", "Bowl avg", "Strike rate", "Economy")
