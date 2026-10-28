@@ -16,16 +16,19 @@ COLUMNS = {
     "matches": ["match_id", "date", "type", "our_team", "team_a", "score_a",
                 "team_b", "score_b", "result", "format", "overs", "toss"],
     "batting": ["match_id", "date", "type", "team", "is_ours", "player", "how_out",
-                "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr"],
+                "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos"],
     "bowling": ["match_id", "date", "type", "team", "is_ours", "player", "overs",
                 "maidens", "runs", "wickets", "econ", "dots", "fours_conceded",
                 "sixes_conceded", "wides", "no_balls"],
+    # name pairs you marked "not the same player", so they stop being suggested
+    "name_ignores": ["name_a", "name_b"],
 }
 NUMERIC = {
     "matches": [],
-    "batting": ["runs", "balls", "fours", "sixes", "sr"],
+    "batting": ["runs", "balls", "fours", "sixes", "sr", "pos"],
     "bowling": ["overs", "maidens", "runs", "wickets", "econ", "dots",
                 "fours_conceded", "sixes_conceded", "wides", "no_balls"],
+    "name_ignores": [],
 }
 
 
@@ -82,12 +85,24 @@ def _spreadsheet():
 
 @st.cache_resource(show_spinner=False)
 def _ensure_tabs():
+    """Create missing tabs, and extend the header of older tabs when new columns were
+    added to COLUMNS (e.g. batting 'pos'), so new data lands under the right header."""
     sh = _spreadsheet()
-    titles = [ws.title for ws in _retry(sh.worksheets)]
-    for name in COLUMNS:
-        if name not in titles:
-            ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(COLUMNS[name]))
-            _retry(ws.update, [COLUMNS[name]], "A1")
+    existing = {ws.title: ws for ws in _retry(sh.worksheets)}
+    for name, cols in COLUMNS.items():
+        ws = existing.get(name)
+        if ws is None:
+            ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(cols))
+            _retry(ws.update, [cols], "A1")
+            continue
+        if ws.col_count < len(cols):
+            _retry(ws.add_cols, len(cols) - ws.col_count)
+        head = [_norm(h) for h in _retry(ws.row_values, 1)]
+        while head and not head[-1]:
+            head.pop()
+        want = [_norm(c) for c in cols]
+        if head and len(head) < len(want) and head == want[:len(head)]:
+            _retry(ws.update, [cols], "A1")
     return True
 
 
@@ -151,6 +166,8 @@ def _sheets_overwrite(name, df):
     ws = _retry(_spreadsheet().worksheet, name)  # fresh copy so the grid size is current
     if ws.row_count < len(data):
         _retry(ws.add_rows, len(data) - ws.row_count)
+    if ws.col_count < len(cols):
+        _retry(ws.add_cols, len(cols) - ws.col_count)
     _retry(ws.update, data, "A1", value_input_option="USER_ENTERED")
 
     stale = []
@@ -178,7 +195,8 @@ def _csv_append(name, rows):
         return
     os.makedirs(DATA_DIR, exist_ok=True)
     df = _csv_load(name)
-    df = pd.concat([df, pd.DataFrame(rows)[COLUMNS[name]]], ignore_index=True)
+    df = pd.concat([df.reindex(columns=COLUMNS[name]),
+                    pd.DataFrame(rows).reindex(columns=COLUMNS[name])], ignore_index=True)
     df.to_csv(_csv_path(name), index=False)
 
 
@@ -295,6 +313,38 @@ def rename_player(variants, canonical):
         n += int(bowl[["player"]].isin(targets).to_numpy().sum())
     merge_players(variants, canonical)
     return n
+
+
+# ---------------- "not the same player" memory ----------------
+def ignored_pairs():
+    """Name pairs marked as different players, as a set of frozensets."""
+    df = load("name_ignores")
+    pairs = set()
+    for a, b in zip(df["name_a"].fillna("").astype(str), df["name_b"].fillna("").astype(str)):
+        if a.strip() and b.strip() and a != b:
+            pairs.add(frozenset((a, b)))
+    return pairs
+
+
+def add_ignored_pairs(pairs):
+    have = ignored_pairs()
+    rows = []
+    for a, b in pairs:
+        key = frozenset((a, b))
+        if a != b and key not in have:
+            have.add(key)
+            x, y = sorted(key)
+            rows.append({"name_a": x, "name_b": y})
+    _append("name_ignores", rows)
+    clear_cache()
+
+
+def remove_ignored_pairs(pairs):
+    drop = {frozenset(p) for p in pairs}
+    df = load("name_ignores")
+    keep = [frozenset((str(a), str(b))) not in drop
+            for a, b in zip(df["name_a"].fillna(""), df["name_b"].fillna(""))]
+    _overwrite("name_ignores", df[keep])
 
 
 def export_excel(path):
