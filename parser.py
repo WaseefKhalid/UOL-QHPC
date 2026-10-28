@@ -47,6 +47,19 @@ def _parse_dismissal(prefix):
     return player, "other", "", ""
 
 
+def _match_team(name, team_a, team_b):
+    """Map a scorecard header's team name onto the summary's team_a / team_b, so both
+    innings use exactly the same names (and the right side is kept when saving)."""
+    import difflib
+    if not (team_a or team_b):
+        return name
+    key = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    n = key(name)
+    ra = difflib.SequenceMatcher(None, n, key(team_a)).ratio() if team_a else -1
+    rb = difflib.SequenceMatcher(None, n, key(team_b)).ratio() if team_b else -1
+    return team_a if ra >= rb else team_b
+
+
 def _is_num(x):
     return bool(re.fullmatch(r"\d+(\.\d+)?", x))
 
@@ -131,7 +144,7 @@ def parse_stumps_pdf(file_like):
     mode, batting_team, pos = None, "", 0
     for line in lines:
         if re.search(r" R B 4s 6s SR$", line):
-            batting_team = re.sub(r" R B 4s 6s SR$", "", line).strip()
+            batting_team = _match_team(re.sub(r" R B 4s 6s SR$", "", line).strip(), team_a, team_b)
             mode = "bat"
             pos = 0  # batting order restarts for each innings
             continue
