@@ -94,17 +94,28 @@ def _spreadsheet():
     return gc.open_by_key(st.secrets["sheet_key"])
 
 
+# The tab layout, passed into the cached setup below so that adding a tab or column
+# gives a new cache entry (otherwise Streamlit reuses the old "done" from before the change).
+SCHEMA = tuple((name, tuple(cols)) for name, cols in COLUMNS.items())
+
+
+def _create_tab(sh, name):
+    ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(COLUMNS[name]))
+    _retry(ws.update, [COLUMNS[name]], "A1")
+    return ws
+
+
 @st.cache_resource(show_spinner=False)
-def _ensure_tabs():
+def _ensure_tabs(schema):
     """Create missing tabs, and extend the header of older tabs when new columns were
     added to COLUMNS (e.g. batting 'pos'), so new data lands under the right header."""
     sh = _spreadsheet()
     existing = {ws.title: ws for ws in _retry(sh.worksheets)}
-    for name, cols in COLUMNS.items():
+    for name, cols in schema:
+        cols = list(cols)
         ws = existing.get(name)
         if ws is None:
-            ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(cols))
-            _retry(ws.update, [cols], "A1")
+            _create_tab(sh, name)
             continue
         if ws.col_count < len(cols):
             _retry(ws.add_cols, len(cols) - ws.col_count)
@@ -118,9 +129,18 @@ def _ensure_tabs():
 
 
 @st.cache_resource(show_spinner=False)
+def _ws_cached(name, schema):
+    import gspread
+    _ensure_tabs(schema)
+    sh = _spreadsheet()
+    try:
+        return _retry(sh.worksheet, name)
+    except gspread.exceptions.WorksheetNotFound:
+        return _create_tab(sh, name)  # safety net: never fail just because a tab is missing
+
+
 def _ws(name):
-    _ensure_tabs()
-    return _spreadsheet().worksheet(name)
+    return _ws_cached(name, SCHEMA)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
