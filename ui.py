@@ -107,6 +107,15 @@ CSS = f"""
 .qh-row .vl {{ flex: none; font-weight: 700; color: {DEEP}; font-size: 1.05rem; }}
 .qh-empty {{ padding: 18px 16px; color: {MUTED}; font-size: .9rem; }}
 
+/* recent form */
+.qh-form {{ display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 16px; }}
+.qh-form span {{ min-width: 30px; height: 30px; padding: 0 6px; border-radius: 6px; display: flex;
+                align-items: center; justify-content: center; font-weight: 800; color: #fff; font-size: .82rem; }}
+.qh-form .W {{ background: {BRIGHT}; }}
+.qh-form .L {{ background: #C0392B; }}
+.qh-form .T, .qh-form .D {{ background: #8E9C95; }}
+.qh-form .NR {{ background: #C9D3CE; color: #33413A; }}
+
 /* footer */
 .qh-foot {{ border-top: 1px solid {LINE}; margin-top: 32px; padding-top: 10px; color: #7A8A82;
            font-size: .75rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; }}
@@ -206,10 +215,25 @@ def top_list(title, subtitle, rows):
                 f'<span class="s">{esc(subtitle)}</span></div>{body}</div>', unsafe_allow_html=True)
 
 
+FORM_CODE = {"Won": "W", "Lost": "L", "Tied": "T", "Drawn": "D", "No result": "NR"}
+RESULT_COLOURS = {"Won": f"background-color: #DDF1E6; color: {DEEP}",
+                  "Lost": "background-color: #FBE3E0; color: #8E2A20",
+                  "Tied": "background-color: #EEF1EF", "Drawn": "background-color: #EEF1EF",
+                  "No result": "background-color: #EEF1EF"}
+
+
+def form_strip(results):
+    """results: list of (outcome, tooltip), oldest first."""
+    chips_html = "".join(
+        f'<span class="{FORM_CODE.get(o, "NR")}" title="{esc(t)}">{FORM_CODE.get(o, "?")}</span>'
+        for o, t in results)
+    st.markdown(f'<div class="qh-form">{chips_html}</div>', unsafe_allow_html=True)
+
+
 DECIMALS = ("Avg", "SR", "Econ", "Bat avg", "Bowl avg", "Strike rate", "Economy")
 
 
-def styled(df, top=0):
+def styled(df, top=0, result_col=None):
     """Table with 2-decimal stats, '—' for blanks and the top `top` rows tinted.
     Blank numbers are stored as -inf (shown as '—') so the column still sorts as numbers,
     with blanks last when sorting high to low."""
@@ -227,6 +251,8 @@ def styled(df, top=0):
         else:
             df[c] = df[c].where(df[c].notna(), "—")
     sty = df.style.format(fmt)
+    if result_col and result_col in df.columns:
+        sty = sty.map(lambda v: RESULT_COLOURS.get(v, ""), subset=[result_col])
     if top:
         sty = sty.apply(lambda r: [f"background-color: {TINT}; color: {DEEP}"] * len(r)
                         if r.name < top else [""] * len(r), axis=1)
