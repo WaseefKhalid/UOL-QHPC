@@ -9,13 +9,15 @@ import pandas as pd
 import streamlit as st
 
 import db
+import ui
 from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, NOT_SET, BALLS, guess_ball, guess_type, career_batting, career_bowling, batting_by_position, player_overview,
                    enrich, filter_rows, suggest_name_groups, search_names, team_matches, default_side,
                    team_key, duplicate_evidence, match_proof, batting_proof, find_duplicate_matches,
                    match_source, DUP_LABELS)
 
-st.set_page_config(page_title="QHPC Cricket Stats", page_icon="🏏", layout="wide")
+st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout="wide")
+ui.apply_theme()
 
 def _secret(key, default=None):
     try:
@@ -170,7 +172,7 @@ def reset_filters():
 
 
 with st.sidebar:
-    st.header("🏏 QHPC Stats")
+    ui.sidebar_brand()
     our_names = [n.strip() for n in st.session_state.our_team.split(",") if n.strip()]
     all_teams = sorted(set(bat_all["team"]) | set(bowl_all["team"]))
     other_teams = [t for t in all_teams if not team_matches(t, our_names)]
@@ -287,19 +289,19 @@ if pos_sel:
     note_parts.append("batting at " + ", ".join(f"No. {p}" for p in pos_sel))
 if btype_sel:
     note_parts.append(" & ".join(btype_sel) + " bowlers")
-FILTER_NOTE = ("🔽 Filtered: " + " · ".join(note_parts) + " — change in the sidebar.") if note_parts else ""
+FILTER_NOTE = ("Filtered: " + " · ".join(note_parts)) if note_parts else ""
 unknown_pos = int(bat_base["position"].isna().sum()) if pos_sel else 0
 
 
 def show_filter_note(batting=True):
     if FILTER_NOTE:
-        st.caption(FILTER_NOTE)
+        ui.note(FILTER_NOTE)
     if batting and unknown_pos:
         st.caption(f"{unknown_pos} innings from screenshot uploads have no batting position, "
                    "so they're left out while a position is picked.")
 
 
-st.title("QHPC Cricket Stats")
+ui.masthead(len(matches), len(players), matches["date_dt"].max() if not matches.empty else None)
 TAB_LABELS = {"board": "📊  Leaderboards", "search": "🔎  Player search"}
 if IS_ADMIN:
     TAB_LABELS.update({"add": "➕  Add matches", "matches": "📋  Matches", "manage": "🛠  Manage"})
@@ -588,7 +590,7 @@ def render_profile(name, bat_f, field_f, bowl_f):
     fmts = sorted({f for f in pd.concat([pb["format_label"], pw["format_label"]]) if f != NO_FORMAT})
     n_matches = len(set(pb["match_id"]) | set(pw["match_id"]))
     st.markdown(f"### {name}")
-    st.caption(" · ".join(x for x in [", ".join(teams), f"{n_matches} match(es)", ", ".join(fmts)] if x))
+    ui.chips(teams + [f"{n_matches} match(es)"] + fmts)
 
     view = st.radio("Show", ["Batting", "Bowling"], horizontal=True, key=f"pv_{short_hash(name)}",
                     label_visibility="collapsed")
@@ -603,9 +605,11 @@ def render_profile(name, bat_f, field_f, bowl_f):
             col.metric(lbl, v)
         fd = field_f.loc[field_f["player"] == name, "dismissal"].value_counts()
         if fd.sum():
-            st.caption("Fielding: " + " · ".join(f"{int(fd.get(k, 0))} {lbl}" for k, lbl in [
-                ("caught", "catches"), ("caught & bowled", "caught & bowled"),
-                ("stumped", "stumpings"), ("run out", "run-outs")] if fd.get(k, 0)))
+            st.caption("Fielding: " + " · ".join(
+                f"{int(fd.get(k, 0))} {one if int(fd.get(k, 0)) == 1 else many}" for k, one, many in [
+                    ("caught", "catch", "catches"), ("caught & bowled", "caught & bowled", "caught & bowled"),
+                    ("stumped", "stumping", "stumpings"), ("run out", "run-out", "run-outs")]
+                if fd.get(k, 0)))
         left, right = st.columns([2, 3])
         with left:
             st.markdown("**By batting position**")
@@ -613,7 +617,7 @@ def render_profile(name, bat_f, field_f, bowl_f):
             if bp.empty:
                 st.caption("No batting positions recorded.")
             else:
-                st.dataframe(bp, hide_index=True, width="stretch")
+                st.dataframe(ui.styled(bp), hide_index=True, width="stretch")
         with right:
             st.markdown("**Runs, innings by innings**")
             form = pb.reset_index(drop=True)[["runs"]].rename(columns={"runs": "Runs"})
@@ -621,10 +625,10 @@ def render_profile(name, bat_f, field_f, bowl_f):
             st.bar_chart(form, height=220, x_label="Innings", y_label="Runs")
         st.markdown("**Match by match**")
         mbm = pb.sort_values("date_dt", ascending=False, na_position="last")
-        st.dataframe(pd.DataFrame({
+        st.dataframe(ui.styled(pd.DataFrame({
             "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
             "Format": mbm["format_label"], "Pos": mbm["position"], "How out": mbm["how_out"], "R": mbm["runs"], "B": mbm["balls"],
-            "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]}),
+            "4s": mbm["fours"], "6s": mbm["sixes"], "SR": mbm["sr"]})),
             hide_index=True, width="stretch")
     else:
         if pw.empty:
@@ -638,10 +642,10 @@ def render_profile(name, bat_f, field_f, bowl_f):
             col.metric(lbl, v)
         st.markdown("**Match by match**")
         mbm = pw.sort_values("date_dt", ascending=False, na_position="last")
-        st.dataframe(pd.DataFrame({
+        st.dataframe(ui.styled(pd.DataFrame({
             "Date": fmt_date(mbm["date_dt"]), "Vs": mbm["opponent"], "Ball": mbm["ball_label"],
             "Format": mbm["format_label"], "O": mbm["overs"], "M": mbm["maidens"], "R": mbm["runs"], "W": mbm["wickets"],
-            "Econ": mbm["econ"], "Wd": mbm["wides"], "NB": mbm["no_balls"]}),
+            "Econ": mbm["econ"], "Wd": mbm["wides"], "NB": mbm["no_balls"]})),
             hide_index=True, width="stretch")
 
 
@@ -692,7 +696,7 @@ def player_search(bat_f, field_f, bowl_f, players):
         found = pd.concat([found, pd.DataFrame({"Player": missing, "Matches": 0})], ignore_index=True)
     if fuzzy:
         found = found.set_index("Player").loc[names].reset_index()
-    st.dataframe(found, hide_index=True, width="stretch", height=min(38 + 35 * len(found), 320),
+    st.dataframe(ui.styled(found), hide_index=True, width="stretch", height=min(38 + 35 * len(found), 320),
                  column_config={"Teams": st.column_config.TextColumn(width="medium")})
 
     pick_list = found["Player"].tolist()
@@ -717,6 +721,40 @@ with TABS["search"]:
 
 
 # ---------------- Leaderboards ----------------
+def highlight_batting(table, bat):
+    if table.empty:
+        return
+    top = table.iloc[0]
+    hs = bat.loc[bat["runs"].idxmax()]
+    sr = table[table["Balls"] >= 20].sort_values("SR", ascending=False)
+    ct = table.sort_values("Catches", ascending=False).iloc[0]
+    ui.cards([
+        ("Runs scored", f"{int(table['Runs'].sum()):,}", f"{bat['match_id'].nunique()} match(es) · {len(bat)} innings"),
+        ("Leading run-scorer", int(top["Runs"]), top["Player"]),
+        ("Highest score", f"{int(hs['runs'])}{'*' if hs['how_out'] == 'not out' else ''}",
+         f"{hs['player']} · {int(hs['balls'])} balls"),
+        ("Best strike rate", f"{sr.iloc[0]['SR']:.1f}" if not sr.empty else "—",
+         f"{sr.iloc[0]['Player']} (min 20 balls)" if not sr.empty else "min 20 balls"),
+        ("Most catches", int(ct["Catches"]), ct["Player"] if ct["Catches"] else ""),
+    ])
+
+
+def highlight_bowling(table, bowl):
+    if table.empty:
+        return
+    top = table.iloc[0]
+    best = bowl.sort_values(["wickets", "runs"], ascending=[False, True]).iloc[0]
+    eco = table[table["Overs"] >= 6].sort_values("Econ")
+    ui.cards([
+        ("Wickets taken", int(table["Wkts"].sum()), f"{bowl['match_id'].nunique()} match(es) · {len(bowl)} spells"),
+        ("Leading wicket-taker", int(top["Wkts"]), top["Player"]),
+        ("Best figures", f"{int(best['wickets'])}/{int(best['runs'])}", best["player"]),
+        ("Best economy", f"{eco.iloc[0]['Econ']:.2f}" if not eco.empty and pd.notna(eco.iloc[0]["Econ"]) else "—",
+         f"{eco.iloc[0]['Player']} (min 6 overs)" if not eco.empty else "min 6 overs"),
+        ("Maidens", int(table["Mdns"].sum()), ""),
+    ])
+
+
 @st.fragment
 def leaderboards(bat_f, field_f, bowl_f):
     c1, c2, c3 = st.columns([2, 1, 2])
@@ -727,16 +765,23 @@ def leaderboards(bat_f, field_f, bowl_f):
     if which == "Batting":
         # no batting-position column here: positions are chosen with the sidebar filter instead
         table = career_batting(bat_f, fielding=field_f).drop(columns=["Pos"], errors="ignore")
+        highlight_batting(table, bat_f)
     else:
         table = career_bowling(bowl_f)
+        highlight_bowling(table, bowl_f)
     table = table[table["Inns"] >= min_inns]
     if q.strip():
         table = table[table["Player"].str.contains(q.strip(), case=False, regex=False)]
     if table.empty:
         st.info("Nothing to show with these filters.")
         return
-    st.dataframe(table, hide_index=True, width="stretch")
-    st.caption(f"{len(table)} player(s). Click a column header to sort.")
+    table = table.reset_index(drop=True)
+    table.insert(0, "#", range(1, len(table) + 1))
+    st.dataframe(ui.styled(table, top=0 if q.strip() else 3), hide_index=True, width="stretch",
+                 height=min(38 + 35 * len(table), 640),
+                 column_config={"#": st.column_config.NumberColumn("#", width="small")})
+    st.caption(f"{len(table)} player(s) · ranked by {'runs' if which == 'Batting' else 'wickets'}. "
+               "Click a column header to sort.")
 
 
 with TABS["board"]:
@@ -774,11 +819,11 @@ if IS_ADMIN:
                 st.rerun()
         st.divider()
         if st.button("⬇️  Build Excel export"):
-            out = "/tmp/qhpc-cricket-db.xlsx"
+            out = "/tmp/uol-qhpc-cricket-db.xlsx"
             db.export_excel(out)
             with open(out, "rb") as f:
-                st.download_button("Download cricket-db.xlsx", f.read(),
-                                   file_name="qhpc-cricket-db.xlsx",
+                st.download_button("Download uol-qhpc-cricket-db.xlsx", f.read(),
+                                   file_name="uol-qhpc-cricket-db.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
@@ -1044,3 +1089,6 @@ if IS_ADMIN:
                     n = db.keep_only_teams(keep_sel)
                     st.session_state["keepteams_done"] = f"Removed {n} rows from {len(remove)} other team(s)."
                     st.rerun()
+
+
+ui.footer(matches["date_dt"].max() if not matches.empty else None)
