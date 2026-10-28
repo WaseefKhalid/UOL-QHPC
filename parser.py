@@ -128,11 +128,12 @@ def parse_stumps_pdf(file_like):
     }
 
     batting, bowling = [], []
-    mode, batting_team = None, ""
+    mode, batting_team, pos = None, "", 0
     for line in lines:
         if re.search(r" R B 4s 6s SR$", line):
             batting_team = re.sub(r" R B 4s 6s SR$", "", line).strip()
             mode = "bat"
+            pos = 0  # batting order restarts for each innings
             continue
         if line.startswith("Bowler O M R W Eco"):
             mode = "bowl"
@@ -144,6 +145,8 @@ def parse_stumps_pdf(file_like):
         if mode == "bat":
             row = _parse_batting(line, batting_team)
             if row:
+                pos += 1
+                row["pos"] = pos
                 batting.append(row)
         elif mode == "bowl":
             bowl_team = team_b if batting_team == team_a else team_a
@@ -224,7 +227,8 @@ def parse_summary_image(file_like):
                 "team": bat_team, "player": d["bat"].strip(),
                 "how_out": "not out" if d["no"] else "other", "bowler": "", "fielder": "",
                 "runs": runs, "balls": balls, "fours": 0, "sixes": 0,
-                "sr": round(runs / balls * 100, 2) if balls else 0})
+                "sr": round(runs / balls * 100, 2) if balls else 0,
+                "pos": ""})  # summary shows top scorers only, not the batting order
             bowling.append({
                 "team": bowl_team, "player": d["bowl"].strip(),
                 "overs": 0.0, "maidens": 0, "runs": int(d["r"]), "wickets": int(d["w"]),
