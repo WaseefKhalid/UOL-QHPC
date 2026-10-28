@@ -8,6 +8,7 @@ import pandas as pd
 BAT_COLS = ["Player", "Inns", "NO", "Runs", "Balls", "HS", "Avg", "SR", "50s", "100s", "4s", "6s", "Catches"]
 BOWL_COLS = ["Player", "Inns", "Overs", "Mdns", "Runs", "Wkts", "Avg", "Econ", "Best", "3W+", "Wd", "NB"]
 NO_FORMAT = "Not recorded"
+NOT_SET = "Not set"
 
 
 # ---------------- small helpers ----------------
@@ -75,8 +76,10 @@ def career_batting(bat, fielding=None):
 
 
 def career_bowling(bowl):
+    has_type = bowl is not None and "bowl_type" in bowl.columns
+    cols = BOWL_COLS[:1] + (["Type"] if has_type else []) + BOWL_COLS[1:]
     if bowl is None or bowl.empty:
-        return pd.DataFrame(columns=BOWL_COLS)
+        return pd.DataFrame(columns=cols)
     rows = []
     for player, g in bowl.groupby("player"):
         balls_each = g["overs"].map(overs_to_balls)
@@ -93,8 +96,9 @@ def career_bowling(bowl):
             "Best": f"{int(best['wickets'])}/{int(best['runs'])}",
             "3W+": int((g["wickets"] >= 3).sum()),
             "Wd": int(g["wides"].sum()), "NB": int(g["no_balls"].sum()),
+            **({"Type": g["bowl_type"].iloc[0]} if has_type else {}),
         })
-    return pd.DataFrame(rows, columns=BOWL_COLS).sort_values(["Wkts", "Avg"], ascending=[False, True],
+    return pd.DataFrame(rows, columns=cols).sort_values(["Wkts", "Avg"], ascending=[False, True],
                                                              ignore_index=True)
 
 
@@ -228,7 +232,7 @@ def enrich(m_df, bat, bowl, field=None):
     return m, bat, bowl, field
 
 
-def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None):
+def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None):
     out = df
     if date_range:
         lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
@@ -240,7 +244,17 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
         out = out[out["format_label"].isin(formats)]
     if positions:
         out = out[out["position"].isin(positions).fillna(False).astype(bool)]
+    if bowl_types:
+        out = out[out["bowl_type"].isin(bowl_types)]
     return out
+
+
+def guess_type(name, types):
+    """(type, known name) when a near-identical spelling already has a bowling type."""
+    for known, t in types.items():
+        if known.lower().strip() == name.lower().strip() or _similar(known, name, 0.88):
+            return t, known
+    return None, None
 
 
 # ---------------- your team ----------------
