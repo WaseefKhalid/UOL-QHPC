@@ -17,7 +17,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 COLUMNS = {
     "matches": ["match_id", "date", "type", "our_team", "team_a", "score_a",
                 "team_b", "score_b", "result", "format", "overs", "toss", "ball",
-                "venue", "opponent", "outcome"],
+                "venue", "opponent", "outcome", "toss_result", "innings"],
     "batting": ["match_id", "date", "type", "team", "is_ours", "player", "how_out",
                 "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos"],
     "bowling": ["match_id", "date", "type", "team", "is_ours", "player", "overs",
@@ -322,6 +322,7 @@ def rows_for(parsed, sides):
         "result": meta["result"], "format": meta["format"], "overs": meta["overs"], "toss": meta["toss"],
         "ball": meta.get("ball", ""),
         "venue": meta.get("venue", ""), "opponent": meta.get("opponent", ""), "outcome": meta.get("outcome", ""),
+        "toss_result": meta.get("toss_result", ""), "innings": meta.get("innings", ""),
     }
     extra = {"match_id": meta["match_id"], "date": meta["date"], "type": match_type, "is_ours": True}
     bat = [{**b, **extra} for b in parsed["batting"] if ours(b["team"])]
