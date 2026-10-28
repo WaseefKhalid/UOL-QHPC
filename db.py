@@ -29,7 +29,10 @@ COLUMNS = {
     "name_ignores": ["name_a", "name_b"],
     # match pairs you checked and marked "not duplicates"
     "dup_ignores": ["match_a", "match_b"],
+    # one row per player: things that don't change match to match (bowling type)
+    "players": ["player", "bowling_type"],
 }
+BOWLING_TYPES = ("Pace", "Spin")
 STAT_TABS = ("matches", "batting", "bowling", "fielding")
 FIELDING_DISMISSALS = ("caught", "caught & bowled", "stumped", "run out")
 NUMERIC = {
@@ -40,6 +43,7 @@ NUMERIC = {
     "fielding": [],
     "name_ignores": [],
     "dup_ignores": [],
+    "players": [],
 }
 
 
@@ -412,6 +416,14 @@ def merge_players(variants, canonical):
     if not field.empty and field["player"].isin(variants).any():
         field["player"] = field["player"].replace(variants, canonical)
         _overwrite("fielding", field)
+    types = bowling_types()
+    if any(v in types for v in variants):
+        keep = types.get(canonical) or next((types[v] for v in variants if types.get(v)), "")
+        for v in variants:
+            types.pop(v, None)
+        if keep:
+            types[canonical] = keep
+        _save_types(types)
     clear_cache()
 
 
@@ -460,7 +472,38 @@ def remove_ignored_pairs(pairs):
     _overwrite("name_ignores", df[keep])
 
 
-# ---------------- duplicates + start from zero ----------------
+# ---------------- bowling type (pace / spin), stored once per player ----------------
+def bowling_types():
+    """{player: 'Pace' | 'Spin'}"""
+    df = load("players")
+    out = {}
+    for name, t in zip(df["player"].fillna("").astype(str), df["bowling_type"].fillna("").astype(str)):
+        if name.strip() and t in BOWLING_TYPES:
+            out[name] = t
+    return out
+
+
+def _save_types(types):
+    rows = sorted((n, t) for n, t in types.items() if t in BOWLING_TYPES)
+    _overwrite("players", pd.DataFrame(rows, columns=COLUMNS["players"]))
+
+
+def set_bowling_types(updates):
+    """Add or change bowling types: {player: 'Pace' | 'Spin' | ''} ('' clears it)."""
+    types = bowling_types()
+    changed = False
+    for name, t in updates.items():
+        if t in BOWLING_TYPES and types.get(name) != t:
+            types[name], changed = t, True
+        elif not t and name in types:
+            types.pop(name)
+            changed = True
+    if changed:
+        _save_types(types)
+    clear_cache()
+
+
+# ---------------- duplicates ----------------
 def dup_ignored():
     df = load("dup_ignores")
     return {frozenset((str(a), str(b))) for a, b in zip(df["match_a"].fillna(""), df["match_b"].fillna(""))
@@ -489,29 +532,18 @@ def remove_double_save(match_id):
     clear_cache()
 
 
-def counts():
-    """Rows per tab, for the 'start from zero' screen."""
-    return {name: len(load(name)) for name in COLUMNS}
-
-
-def delete_all(forget_decisions=False):
-    """Empty every stats tab (headers stay). With forget_decisions, also clear the
-    'not the same player' and 'not duplicates' decisions."""
-    tabs = list(STAT_TABS) + (["name_ignores", "dup_ignores"] if forget_decisions else [])
-    for name in tabs:
-        _overwrite(name, pd.DataFrame(columns=COLUMNS[name]))
-    clear_cache()
-
-
 def export_excel(path):
     from stats import career_batting, career_bowling, enrich
     m, bat, bowl, field = load("matches"), load("batting"), load("bowling"), load("fielding")
     _, bat_e, bowl_e, field_e = enrich(m, bat, bowl, field)
+    types = bowling_types()
+    bowl_e["bowl_type"] = bowl_e["player"].map(types).fillna("Not set")
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
         m.to_excel(xl, sheet_name="Matches", index=False)
         bat.to_excel(xl, sheet_name="Batting", index=False)
         bowl.to_excel(xl, sheet_name="Bowling", index=False)
         field.to_excel(xl, sheet_name="Fielding", index=False)
+        load("players").to_excel(xl, sheet_name="Bowling types", index=False)
         career_batting(bat_e, fielding=field_e).drop(columns=["Pos"], errors="ignore") \
             .to_excel(xl, sheet_name="Career Batting", index=False)
         career_bowling(bowl_e).to_excel(xl, sheet_name="Career Bowling", index=False)
