@@ -257,3 +257,120 @@ def styled(df, top=0, result_col=None):
         sty = sty.apply(lambda r: [f"background-color: {TINT}; color: {DEEP}"] * len(r)
                         if r.name < top else [""] * len(r), axis=1)
     return sty
+
+
+
+# ---------------- shareable player card (PNG) ----------------
+FONT_DIRS = [os.path.join(os.path.dirname(__file__), "assets", "fonts"),
+             "/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/liberation2",
+             "/usr/share/fonts/truetype/dejavu"]
+FONT_FILES = {
+    "serif": ["LiberationSerif-Bold.ttf", "DejaVuSerif-Bold.ttf"],
+    "bold": ["LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf"],
+    "regular": ["LiberationSans-Regular.ttf", "DejaVuSans.ttf"],
+}
+
+
+def _font(kind, size):
+    from PIL import ImageFont
+    for name in FONT_FILES[kind]:
+        for d in FONT_DIRS:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:          # very old Pillow
+        return ImageFont.load_default()
+
+
+def _hex(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _spaced(draw, xy, text, font, fill, spacing):
+    x, y = xy
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + spacing
+    return x
+
+
+def _fit(draw, text, kind, size, max_w, min_size=40):
+    f = _font(kind, size)
+    while draw.textlength(text, font=f) > max_w and size > min_size:
+        size -= 4
+        f = _font(kind, size)
+    return f
+
+
+def share_card_png(card):
+    """card: dict(name, line, mvp, sections=[(title, [(label, value) × 6]) × 2], extra, scope,
+    footer_right). Returns PNG bytes, 1080×1350 (fits WhatsApp and Instagram)."""
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    W, H, P = 1080, 1350, 72
+    deep, mid, bright, tint, pale = map(_hex, (DEEP, MID, BRIGHT, TINT, PALE))
+    mint, white, ink, muted = _hex("#8FD4B0"), (255, 255, 255), _hex(INK), _hex(MUTED)
+    img = Image.new("RGB", (W, H), white)
+    d = ImageDraw.Draw(img)
+
+    # header band
+    band = 400
+    d.rectangle([0, 0, W, band], fill=deep)
+    d.rectangle([0, 0, W, 14], fill=bright)
+    if os.path.exists(LOGO):
+        try:
+            logo = Image.open(LOGO).convert("RGBA")
+            logo.thumbnail((120, 120))
+            img.paste(logo, (W - P - logo.width, 52), logo)
+        except Exception:
+            pass
+    _spaced(d, (P, 56), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), mint, 3.2)
+    d.text((P, 92), "PLAYER CARD", font=_font("bold", 22), fill=(190, 227, 207))
+    name_font = _fit(d, card["name"], "serif", 96, W - 2 * P)
+    d.text((P, 128), card["name"], font=name_font, fill=white)
+    line_font = _fit(d, card.get("line", ""), "regular", 30, W - 2 * P, 20)
+    d.text((P, 258), card.get("line", ""), font=line_font, fill=(205, 233, 217))
+    if card.get("mvp"):
+        f = _font("bold", 30)
+        w = d.textlength(card["mvp"], font=f) + 44
+        d.rounded_rectangle([P, 314, P + w, 370], radius=28, fill=bright)
+        d.text((P + 22, 324), card["mvp"], font=f, fill=white)
+
+    # stat sections
+    def section(y, title, stats):
+        _spaced(d, (P, y), title, _font("bold", 26), mid, 3)
+        d.rectangle([P, y + 40, W - P, y + 43], fill=bright)
+        cols, gap = 3, 18
+        tw = (W - 2 * P - gap * (cols - 1)) / cols
+        th = 122
+        for i, (lbl, val) in enumerate(stats):
+            r, c = divmod(i, cols)
+            x0, y0 = P + c * (tw + gap), y + 66 + r * (th + gap)
+            d.rounded_rectangle([x0, y0, x0 + tw, y0 + th], radius=14, fill=pale, outline=tint, width=2)
+            d.rectangle([x0, y0 + 12, x0 + 6, y0 + th - 12], fill=bright)
+            _spaced(d, (x0 + 24, y0 + 18), lbl.upper(), _font("bold", 20), mid, 2)
+            vf = _fit(d, str(val), "bold", 56, tw - 40, 28)
+            d.text((x0 + 24, y0 + 48), str(val), font=vf, fill=deep)
+        rows = (len(stats) + cols - 1) // cols
+        return y + 62 + rows * (th + gap)
+
+    (t1, s1), (t2, s2) = card["sections"]
+    y = section(band + 36, t1, s1)
+    y = section(y + 8, t2, s2)
+    if card.get("extra"):
+        ef = _fit(d, card["extra"], "regular", 28, W - 2 * P, 18)
+        d.text((P, y + 6), card["extra"], font=ef, fill=muted)
+
+    # footer
+    d.rectangle([0, H - 112, W, H], fill=deep)
+    d.text((P, H - 86), "UOL QHPC Cricket Stats", font=_font("serif", 34), fill=white)
+    d.text((P, H - 44), card.get("scope", ""), font=_font("regular", 22), fill=mint)
+    fr = card.get("footer_right", "")
+    f = _font("regular", 24)
+    d.text((W - P - d.textlength(fr, font=f), H - 80), fr, font=f, fill=(205, 233, 217))
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
