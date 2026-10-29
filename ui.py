@@ -413,6 +413,11 @@ def share_card_png(card):
 
 
 
+def fonts_installed():
+    """True when proper TrueType fonts are available for the graphics (else a plain fallback is used)."""
+    return any(os.path.exists(os.path.join(d, f)) for d in FONT_DIRS for f in FONT_FILES["bold"])
+
+
 def _ellipsize(draw, text, font, max_w):
     text = str(text)
     if draw.textlength(text, font=font) <= max_w:
@@ -422,88 +427,170 @@ def _ellipsize(draw, text, font, max_w):
     return text.rstrip(" ·,") + "…"
 
 
-def list_png(title, subtitle, rows, scope="", footer_right=""):
-    """A ranked list graphic: #1 as a big hero row, the rest below. rows: [(name, value, detail)].
-    Returns PNG bytes, 1080×1350 (fits WhatsApp and Instagram)."""
-    from io import BytesIO
+def _wrap(draw, text, font, max_w, max_lines=2):
+    """Split text into at most max_lines lines that fit max_w (last line ellipsised)."""
+    words, lines, cur = str(text).split(" "), [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textlength(trial, font=font) <= max_w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines - 1] + [" ".join(lines[max_lines - 1:])]
+    return [_ellipsize(draw, ln, font, max_w) for ln in lines]
+
+
+def _text_mid(draw, x, mid_y, text, font, fill):
+    """Draw text vertically centred on mid_y, whatever the font's metrics."""
+    top, bottom = draw.textbbox((0, 0), "Hg0", font=font)[1::2]
+    draw.text((x, mid_y - (top + bottom) / 2), text, font=font, fill=fill)
+
+
+def _canvas(title, subtitle, band=290):
+    """A 1080×1350 image with the green masthead drawn. Returns (img, draw, palette)."""
     from PIL import Image, ImageDraw
     W, H, P = 1080, 1350, 64
-    deep, mid, bright, tint, pale = map(_hex, (DEEP, MID, BRIGHT, TINT, PALE))
-    mint, white, ink, muted = _hex("#8FD4B0"), (255, 255, 255), _hex(INK), _hex(MUTED)
-    img = Image.new("RGB", (W, H), white)
+    pal = {k: _hex(v) for k, v in (("deep", DEEP), ("mid", MID), ("bright", BRIGHT), ("tint", TINT),
+                                   ("pale", PALE), ("ink", INK), ("muted", MUTED))}
+    pal.update(mint=_hex("#8FD4B0"), white=(255, 255, 255), soft=(205, 233, 217), line=_hex("#E1EEE6"))
+    img = Image.new("RGB", (W, H), pal["white"])
     d = ImageDraw.Draw(img)
-
-    band = 300
-    d.rectangle([0, 0, W, band], fill=deep)
-    d.rectangle([0, 0, W, 14], fill=bright)
+    d.rectangle([0, 0, W, band], fill=pal["deep"])
+    d.rectangle([0, 0, W, 14], fill=pal["bright"])
+    logo_w = 0
     if os.path.exists(LOGO):
         try:
             logo = Image.open(LOGO).convert("RGBA")
             logo.thumbnail((110, 110))
             img.paste(logo, (W - P - logo.width, 48), logo)
+            logo_w = logo.width + 20
         except Exception:
             pass
-    _spaced(d, (P, 54), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), mint, 3.2)
-    tf = _fit(d, title, "serif", 84, W - 2 * P - 120, 48)
-    d.text((P, 94), title, font=tf, fill=white)
+    _spaced(d, (P, 52), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), pal["mint"], 3.2)
+    tf = _fit(d, title, "serif", 84, W - 2 * P - logo_w, 44)
+    d.text((P, 92), title, font=tf, fill=pal["white"])
     sf = _fit(d, subtitle, "regular", 32, W - 2 * P, 20)
-    d.text((P, 214), subtitle, font=sf, fill=(205, 233, 217))
+    d.text((P, 206), _ellipsize(d, subtitle, sf, W - 2 * P), font=sf, fill=pal["soft"])
+    return img, d, pal
 
-    foot = 112
+
+def _finish(img, d, pal, scope, footer_right):
+    from io import BytesIO
+    W, H, P, foot = 1080, 1350, 64, 112
+    d.rectangle([0, H - foot, W, H], fill=pal["deep"])
+    d.text((P, H - 88), "UOL QHPC Cricket Stats", font=_font("serif", 34), fill=pal["white"])
+    sc = _font("regular", 22)
+    d.text((P, H - 44), _ellipsize(d, scope, sc, W - 2 * P - 280), font=sc, fill=pal["mint"])
+    f = _font("regular", 24)
+    d.text((W - P - d.textlength(footer_right, font=f), H - 82), footer_right, font=f, fill=pal["soft"])
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def list_png(title, subtitle, rows, scope="", footer_right=""):
+    """A ranked list graphic: #1 as a big hero row, the rest below. rows: [(name, value, detail)].
+    Every text box is measured, so names and details never run into the numbers. 1080×1350 PNG."""
+    W, H, P, band, foot = 1080, 1350, 64, 290, 112
+    img, d, pal = _canvas(title, subtitle, band)
     top, bottom = band + 30, H - foot - 26
     if not rows:
         f = _font("regular", 36)
         msg = "No data in these filters yet"
-        d.text(((W - d.textlength(msg, font=f)) / 2, (top + bottom) / 2 - 20), msg, font=f, fill=muted)
-    else:
-        rest = rows[1:]
-        hero_h = 220 if len(rest) <= 5 else 196
-        row_h = min(128, (bottom - top - hero_h - 14) / max(len(rest), 1))
-        block = hero_h + 14 + row_h * len(rest)
-        top += max(0, (bottom - top - block) / 2)     # centre short lists vertically
-        big = row_h >= 110
-        # hero (#1)
-        n, v, det = rows[0]
-        d.rounded_rectangle([P, top, W - P, top + hero_h], radius=18, fill=tint)
-        d.rectangle([P, top + 18, P + 8, top + hero_h - 18], fill=bright)
-        cx, cy, r = P + 64, top + hero_h / 2, 38
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=bright)
-        f1 = _font("bold", 42)
-        d.text((cx - d.textlength("1", font=f1) / 2, cy - 25), "1", font=f1, fill=white)
-        vf = _fit(d, str(v), "bold", 124, 340, 60)
-        vw = d.textlength(str(v), font=vf)
-        d.text((W - P - 30 - vw, top + hero_h / 2 - 72), str(v), font=vf, fill=deep)
-        name_w = W - P - 30 - vw - 30 - (P + 124)
-        nf = _fit(d, n, "bold", 60, name_w, 32)
-        d.text((P + 124, top + hero_h / 2 - 66), _ellipsize(d, n, nf, name_w), font=nf, fill=deep)
-        df = _font("regular", 29)
-        d.text((P + 124, top + hero_h / 2 + 14), _ellipsize(d, det, df, W - P - 30 - (P + 124)), font=df,
-               fill=_hex("#44544C"))
-        # the rest
-        y = top + hero_h + 14
-        sizes = (40, 26, 56, 36) if big else ((34, 22, 46, 34) if row_h >= 80 else (30, 20, 38, 30))
-        for i, (n, v, det) in enumerate(rest, start=2):
-            if i % 2 == 0:
-                d.rounded_rectangle([P, y, W - P, y + row_h - 6], radius=12, fill=pale)
-            mid_y = y + (row_h - 6) / 2
-            ns, ds, vs, rs = sizes
-            rf = _font("bold", rs)
-            d.text((P + 26, mid_y - rs * 0.62), str(i), font=rf, fill=mid)
-            vf = _font("bold", vs)
-            vw = d.textlength(str(v), font=vf)
-            d.text((W - P - 26 - vw, mid_y - vs * 0.62), str(v), font=vf, fill=deep)
-            avail = W - P - 26 - vw - 24 - (P + 90)
-            nf, dfs = _font("bold", ns), _font("regular", ds)
-            d.text((P + 90, mid_y - ns - 2), _ellipsize(d, n, nf, avail), font=nf, fill=ink)
-            d.text((P + 90, mid_y + 8), _ellipsize(d, det, dfs, avail), font=dfs, fill=muted)
-            y += row_h
+        d.text(((W - d.textlength(msg, font=f)) / 2, (top + bottom) / 2 - 20), msg, font=f, fill=pal["muted"])
+        return _finish(img, d, pal, scope, footer_right)
 
-    d.rectangle([0, H - foot, W, H], fill=deep)
-    d.text((P, H - 86), "UOL QHPC Cricket Stats", font=_font("serif", 34), fill=white)
-    sc = _font("regular", 22)
-    d.text((P, H - 44), _ellipsize(d, scope, sc, W - 2 * P - 260), font=sc, fill=mint)
-    f = _font("regular", 24)
-    d.text((W - P - d.textlength(footer_right, font=f), H - 80), footer_right, font=f, fill=(205, 233, 217))
-    buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    rest = rows[1:]
+    hero_h = 236 if len(rest) <= 5 else 206
+    row_h = min(124, (bottom - top - hero_h - 14) / max(len(rest), 1))
+    block = hero_h + 14 + row_h * len(rest)
+    top += max(0, (bottom - top - block) / 2)          # centre short lists vertically
+
+    # hero (#1): number on the right, name + detail in the space left of it
+    n, v, det = rows[0]
+    d.rounded_rectangle([P, top, W - P, top + hero_h], radius=18, fill=pal["tint"])
+    d.rectangle([P, top + 18, P + 8, top + hero_h - 18], fill=pal["bright"])
+    cx, cy, r = P + 62, top + hero_h / 2, 36
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=pal["bright"])
+    f1 = _font("bold", 40)
+    _text_mid(d, cx - d.textlength("1", font=f1) / 2, cy, "1", f1, pal["white"])
+    vf = _fit(d, str(v), "bold", 120, 330, 56)
+    vw = d.textlength(str(v), font=vf)
+    _text_mid(d, W - P - 32 - vw, cy, str(v), vf, pal["deep"])
+    left, right = P + 120, W - P - 32 - vw - 36
+    nf = _fit(d, n, "bold", 56, right - left, 30)
+    df = _font("regular", 27)
+    det_lines = _wrap(d, det, df, right - left, 2)
+    gap, line_h = 10, 36
+    block_h = 64 + gap + line_h * len(det_lines)
+    y0 = cy - block_h / 2
+    _text_mid(d, left, y0 + 32, _ellipsize(d, n, nf, right - left), nf, pal["deep"])
+    for i, ln in enumerate(det_lines):
+        _text_mid(d, left, y0 + 64 + gap + line_h * i + line_h / 2, ln, df, _hex("#44544C"))
+
+    # the rest
+    y = top + hero_h + 14
+    big = row_h >= 104
+    ns, ds, vs, rs = (38, 24, 52, 34) if big else ((34, 22, 44, 32) if row_h >= 80 else (29, 19, 36, 28))
+    for i, (n, v, det) in enumerate(rest, start=2):
+        if i % 2 == 0:
+            d.rounded_rectangle([P, y, W - P, y + row_h - 6], radius=12, fill=pal["pale"])
+        mid_y = y + (row_h - 6) / 2
+        _text_mid(d, P + 26, mid_y, str(i), _font("bold", rs), pal["mid"])
+        vf = _font("bold", vs)
+        vw = d.textlength(str(v), font=vf)
+        _text_mid(d, W - P - 26 - vw, mid_y, str(v), vf, pal["deep"])
+        avail = W - P - 26 - vw - 30 - (P + 90)
+        nf, dfs = _font("bold", ns), _font("regular", ds)
+        _text_mid(d, P + 90, mid_y - ds * 0.75, _ellipsize(d, n, nf, avail), nf, pal["ink"])
+        _text_mid(d, P + 90, mid_y + ns * 0.62, _ellipsize(d, det, dfs, avail), dfs, pal["muted"])
+        y += row_h
+    return _finish(img, d, pal, scope, footer_right)
+
+
+def table_png(title, subtitle, columns, rows, scope="", footer_right="", top=3):
+    """A leaderboard table graphic. columns: [(label, width or None for the flexible name column,
+    align 'l'/'r')]; rows: list of value lists in the same order. 1080×1350 PNG."""
+    W, H, P, band, foot = 1080, 1350, 48, 290, 112
+    img, d, pal = _canvas(title, subtitle, band)
+    y, bottom = band + 34, H - foot - 26
+    if not rows:
+        f = _font("regular", 36)
+        msg = "No data in these filters yet"
+        d.text(((W - d.textlength(msg, font=f)) / 2, (y + bottom) / 2 - 20), msg, font=f, fill=pal["muted"])
+        return _finish(img, d, pal, scope, footer_right)
+    fixed = sum(w for _, w, _ in columns if w)
+    flex = W - 2 * P - fixed
+    widths = [w if w else flex for _, w, _ in columns]
+    head_h = 58
+    row_h = min(84, (bottom - y - head_h) / len(rows))
+    fs = 33 if row_h >= 76 else (30 if row_h >= 60 else (27 if row_h >= 52 else 24))
+    # header row
+    d.rounded_rectangle([P, y, W - P, y + head_h], radius=10, fill=pal["mid"])
+    x, hf = P, _font("bold", 22)
+    for (label, _, align), w in zip(columns, widths):
+        lx = x + 16 if align == "l" else x + w - 16 - d.textlength(label.upper(), font=hf)
+        _text_mid(d, lx, y + head_h / 2, label.upper(), hf, pal["white"])
+        x += w
+    y += head_h + 4
+    for i, vals in enumerate(rows):
+        hi = i < top
+        if hi or i % 2 == 1:
+            d.rounded_rectangle([P, y, W - P, y + row_h - 4], radius=8, fill=pal["tint"] if hi else pal["pale"])
+        if hi:
+            d.rectangle([P, y + 8, P + 6, y + row_h - 12], fill=pal["bright"])
+        mid_y, x = y + (row_h - 4) / 2, P
+        for j, ((label, _, align), w) in enumerate(zip(columns, widths)):
+            txt = str(vals[j])
+            f = _font("bold" if (j <= 1 or hi) else "regular", fs)
+            if align == "l":                       # names: shrink a little before cutting them short
+                f = _fit(d, txt, "bold", fs, w - 28, max(20, fs - 8))
+            txt = _ellipsize(d, txt, f, w - 28)
+            lx = x + 16 if align == "l" else x + w - 16 - d.textlength(txt, font=f)
+            _text_mid(d, lx, mid_y, txt, f, pal["deep"] if (j <= 1 or hi) else pal["ink"])
+            x += w
+        y += row_h
+    return _finish(img, d, pal, scope, footer_right)
