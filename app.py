@@ -585,6 +585,26 @@ def graphic_download(title, subtitle, rows, key, label="⬇️  Download graphic
                        key=key, disabled=not rows, width="stretch")
 
 
+@st.cache_data(show_spinner=False)
+def table_png_cached(payload):
+    import json
+    a = json.loads(payload)
+    return ui.table_png(a["title"], a["subtitle"], [tuple(c) for c in a["columns"]], a["rows"],
+                        a["scope"], a["footer_right"])
+
+
+def table_download(title, subtitle, columns, rows, key, label):
+    """A download button for a branded PNG of a leaderboard table (same filters as the page)."""
+    import json
+    payload = json.dumps({"title": title, "subtitle": subtitle, "columns": columns,
+                          "rows": [[str(v) for v in r] for r in rows],
+                          "scope": FILTER_NOTE or f"All matches from {ui.STATS_FROM}",
+                          "footer_right": f"As of {dt.date.today():%d %b %Y}"})
+    slug = "-".join(title.lower().split())
+    st.download_button(label, table_png_cached(payload), file_name=f"UOL-QHPC-{slug}.png", mime="image/png",
+                       key=key, disabled=not rows, width="stretch")
+
+
 REC_MOBILE = ["P", "W", "L", "Win %"]
 
 
@@ -718,6 +738,11 @@ def data_health():
                        pd.DataFrame(off, columns=["Saved name", "Suggestion"])))
         checks.append(("Names typed twice in the squad list", "check", "Google Sheet → tab squad",
                        pd.DataFrame({"Full name": db.squad_duplicates()})))
+
+    if not ui.fonts_installed():
+        checks.append(("Fonts for the download graphics aren't installed", "fix",
+                       "GitHub → packages.txt → add a new line: fonts-liberation → then Reboot the app",
+                       pd.DataFrame({"What happens now": ["Graphics use a plain backup font (no bold or serif titles)"]})))
 
     untyped = sorted(set(bowl_all["player"]) - set(types))
     checks.append(("Bowlers without pace or spin", "fix", "🛠 Manage → Bowling types",
@@ -1275,6 +1300,9 @@ def highlight_bowling(table, bowl):
     ])
 
 
+LEADERBOARD_GRAPHIC_ROWS = 15
+
+
 @st.fragment
 def leaderboards(bat_f, field_f, bowl_f):
     c1, c2, c3 = st.columns([2, 1, 2])
@@ -1297,6 +1325,22 @@ def leaderboards(bat_f, field_f, bowl_f):
         return
     table = table.reset_index(drop=True)
     table.insert(0, "#", range(1, len(table) + 1))
+    top15 = table.head(LEADERBOARD_GRAPHIC_ROWS)
+    mins = f" · min {min_inns} innings" if min_inns > 1 else ""
+    if which == "Batting":
+        table_download("Batting leaderboard", f"Top {len(top15)} by runs{mins}",
+                       [["#", 70, "r"], ["Player", None, "l"], ["Inns", 100, "r"], ["Runs", 110, "r"],
+                        ["HS", 100, "r"], ["Avg", 120, "r"], ["SR", 130, "r"]],
+                       [[r["#"], r["Player"], r["Inns"], r["Runs"], r["HS"], _num(r["Avg"]), _num(r["SR"])]
+                        for _, r in top15.iterrows()],
+                       key="lb_dl_bat", label=f"⬇️  Download batting leaderboard — top {len(top15)} (PNG)")
+    else:
+        table_download("Bowling leaderboard", f"Top {len(top15)} by wickets{mins}",
+                       [["#", 70, "r"], ["Player", None, "l"], ["Inns", 100, "r"], ["Wkts", 110, "r"],
+                        ["Best", 120, "r"], ["Avg", 120, "r"], ["Econ", 120, "r"]],
+                       [[r["#"], r["Player"], r["Inns"], r["Wkts"], r["Best"], _num(r["Avg"]), _num(r["Econ"])]
+                        for _, r in top15.iterrows()],
+                       key="lb_dl_bowl", label=f"⬇️  Download bowling leaderboard — top {len(top15)} (PNG)")
     show_table(table, "lb_" + which, top=0 if q.strip() else 3, max_height=640,
                mobile_cols=(["#", "Player", "Runs", "Avg", "SR"] if which == "Batting"
                             else ["#", "Player", "Wkts", "Avg", "Econ"]))
@@ -1308,14 +1352,15 @@ def _num(v, dec=2):
     return "—" if v is None or pd.isna(v) else f"{v:.{dec}f}"
 
 
-def _when(r):
+def _when(r, with_format=True):
     parts = [f"vs {r['opponent']}" if r["opponent"] else "", f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "",
-             r["format_label"] if r["format_label"] != NO_FORMAT else ""]
+             r["format_label"] if with_format and r["format_label"] != NO_FORMAT else ""]
     return " · ".join(p for p in parts if p)
 
 
 MIN_INNS_FOR_AVG = 3     # innings needed to appear in "Best batting average"
 MIN_WKTS_FOR_AVG = 3     # wickets needed to appear in "Best bowling average"
+MIN_BALLS_FOR_SR = 20    # balls faced needed to appear in "Highest strike rate"
 
 
 @st.fragment
@@ -1329,15 +1374,22 @@ def top_performers(bat_f, bowl_f):
 
     most_runs = [(r["Player"], int(r["Runs"]), f"{r['Inns']} inns · avg {_num(r['Avg'])} · SR {_num(r['SR'])}")
                  for _, r in cb.sort_values(["Runs", "SR"], ascending=[False, False]).head(n).iterrows()]
+    top_inns = (bat_f.assign(_no=bat_f["how_out"] == "not out")
+                .sort_values(["runs", "_no", "balls"], ascending=[False, False, True]).head(n))
     best_scores = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}",
-                    f"{int(r['balls'])} balls · {_when(r)}")
-                   for _, r in bat_f.assign(_no=bat_f["how_out"] == "not out")
-                   .sort_values(["runs", "_no", "balls"], ascending=[False, False, True]).head(n).iterrows()]
+                    f"{int(r['balls'])} balls · {_when(r)}") for _, r in top_inns.iterrows()]
+    best_scores_g = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}",
+                      f"{int(r['balls'])} balls · {_when(r, False)}") for _, r in top_inns.iterrows()]
     most_wkts = [(r["Player"], int(r["Wkts"]), f"{r['Inns']} inns · avg {_num(r['Avg'])} · econ {_num(r['Econ'])}")
                  for _, r in cw[cw["Wkts"] > 0].sort_values(["Wkts", "Avg"], ascending=[False, True]).head(n).iterrows()]
     spells = bowl_f[bowl_f["wickets"] > 0].sort_values(["wickets", "runs"], ascending=[False, True]).head(n)
     best_figs = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
                   f"{r['overs']:g} ov · {_when(r)}") for _, r in spells.iterrows()]
+    best_figs_g = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
+                    f"{r['overs']:g} ov · {_when(r, False)}") for _, r in spells.iterrows()]
+    q_sr = cb[(cb["Balls"] >= MIN_BALLS_FOR_SR) & cb["SR"].notna()]
+    best_sr = [(r["Player"], f"{r['SR']:.2f}", f"{r['Runs']} runs · {r['Balls']} balls · {r['Inns']} inns")
+               for _, r in q_sr.sort_values(["SR", "Runs"], ascending=False).head(n).iterrows()]
     q_bat = cb[(cb["Inns"] >= MIN_INNS_FOR_AVG) & cb["Avg"].notna()]
     bat_avg = [(r["Player"], f"{r['Avg']:.2f}", f"{r['Inns']} inns · {r['Runs']} runs · SR {_num(r['SR'])}")
                for _, r in q_bat.sort_values(["Avg", "Runs"], ascending=False).head(n).iterrows()]
@@ -1346,23 +1398,30 @@ def top_performers(bat_f, bowl_f):
                 for _, r in q_bowl.sort_values(["Avg", "Wkts"], ascending=[True, False]).head(n).iterrows()]
 
     st.caption("Each list has a download button for a ready-to-share graphic.")
-    lists = [
-        ("Most runs", "Batting", most_runs, "Batting"),
-        ("Highest scores", "Single innings", best_scores, "Highest single-innings scores"),
+    batting = [
+        ("Most runs", "Batting", most_runs, "Batting", None),
+        ("Highest scores", "Single innings", best_scores, "Highest single-innings scores", best_scores_g),
         ("Best batting average", f"Min {MIN_INNS_FOR_AVG} innings", bat_avg,
-         f"Batting average · min {MIN_INNS_FOR_AVG} innings"),
-        ("Most wickets", "Bowling", most_wkts, "Bowling"),
-        ("Best bowling figures", "Single innings", best_figs, "Best figures in an innings"),
-        ("Best bowling average", f"Min {MIN_WKTS_FOR_AVG} wickets", bowl_avg,
-         f"Bowling average · min {MIN_WKTS_FOR_AVG} wickets"),
+         f"Batting average · min {MIN_INNS_FOR_AVG} innings", None),
+        ("Highest strike rate", f"Min {MIN_BALLS_FOR_SR} balls", best_sr,
+         f"Strike rate · min {MIN_BALLS_FOR_SR} balls faced", None),
     ]
-    for pair in ([lists[0], lists[1]], [lists[3], lists[4]], [lists[2], lists[5]]):
-        cols = st.columns(2, gap="medium")
-        for col, (title, sub, rows, gsub) in zip(cols, pair):
-            with col:
-                ui.top_list(title, sub, rows)
-                graphic_download(title, f"Top {len(rows)} · {gsub}", rows, key=f"tp_dl_{short_hash(title)}")
-                st.write("")
+    bowling = [
+        ("Most wickets", "Bowling", most_wkts, "Bowling", None),
+        ("Best bowling figures", "Single innings", best_figs, "Best figures in an innings", best_figs_g),
+        ("Best bowling average", f"Min {MIN_WKTS_FOR_AVG} wickets", bowl_avg,
+         f"Bowling average · min {MIN_WKTS_FOR_AVG} wickets", None),
+    ]
+    for num, group, lists in (("01", "Batting", batting), ("02", "Bowling", bowling)):
+        ui.section(num, group)
+        for i in range(0, len(lists), 2):
+            cols = st.columns(2, gap="medium")
+            for col, (title, sub, rows, gsub, grows) in zip(cols, lists[i:i + 2]):
+                with col:
+                    ui.top_list(title, sub, rows)
+                    graphic_download(title, f"Top {len(rows)} · {gsub}", grows or rows,
+                                     key=f"tp_dl_{short_hash(title)}")
+                    st.write("")
 
 
 with TABS["top"]:
