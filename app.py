@@ -12,6 +12,25 @@ import streamlit as st
 
 import db
 import ui
+import parser as _parser
+import stats as _stats
+
+st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout="wide")
+
+# All five .py files must be from the same update. If one wasn't replaced on GitHub, say which one
+# instead of crashing with a confusing error.
+_NEEDS = {"db.py": (db, ["get_list", "add_to_list", "rename_in_matches", "relink_names", "rename_many"]),
+          "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points"]),
+          "ui.py": (ui, ["table_png", "list_png", "GRAPHICS_VERSION", "fonts_installed"]),
+          "parser.py": (_parser, ["parse_stumps_pdf", "parse_summary_image"])}
+_old = [f for f, (mod, names) in _NEEDS.items() if any(not hasattr(mod, n) for n in names)]
+if _old:
+    st.error("**Update not finished:** " + ", ".join(f"`{f}`" for f in _old) + " on GitHub "
+             + ("is" if len(_old) == 1 else "are") + " still the old version. Replace "
+             + ("it" if len(_old) == 1 else "them") + " with the latest file(s), then use "
+             "Manage app → ⋮ → Reboot app.")
+    st.stop()
+
 from parser import parse_stumps_pdf, parse_summary_image
 from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CHOICES, guess_ball,
                    TOSSES, INNINGS, guess_toss, guess_innings, POINTS_RULES, match_points,
@@ -24,7 +43,7 @@ from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CH
                    team_key, duplicate_evidence, match_proof, batting_proof, find_duplicate_matches,
                    match_source, DUP_LABELS)
 
-st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout="wide")
+
 ui.apply_theme()
 
 def _secret(key, default=None):
