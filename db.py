@@ -17,7 +17,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 COLUMNS = {
     "matches": ["match_id", "date", "type", "our_team", "team_a", "score_a",
                 "team_b", "score_b", "result", "format", "overs", "toss", "ball",
-                "venue", "opponent", "outcome", "toss_result", "innings"],
+                "venue", "opponent", "outcome", "toss_result", "innings", "coach"],
     "batting": ["match_id", "date", "type", "team", "is_ours", "player", "how_out",
                 "bowler", "fielder", "runs", "balls", "fours", "sixes", "sr", "pos", "scorecard_name"],
     "bowling": ["match_id", "date", "type", "team", "is_ours", "player", "overs",
@@ -36,6 +36,9 @@ COLUMNS = {
     "squad": ["Full name"],
     # scorecard spellings you've confirmed: "Hasnian" -> "Muhammad Hasnain Ali"
     "spellings": ["Scorecard name", "Full name", "In squad"],
+    # lists you can change any time (in the app: Manage → Lists, or straight in the sheet)
+    "formats": ["Match format"],
+    "coaches": ["Coach"],
 }
 BOWLING_TYPES = ("Pace", "Spin")
 STAT_TABS = ("matches", "batting", "bowling", "fielding")
@@ -51,7 +54,14 @@ NUMERIC = {
     "players": [],
     "squad": [],
     "spellings": [],
+    "formats": [],
+    "coaches": [],
 }
+
+
+def _defaults():
+    from stats import FORMAT_CHOICES, COACHES
+    return {"formats": FORMAT_CHOICES, "coaches": COACHES}
 
 
 def use_sheets():
@@ -113,7 +123,8 @@ SCHEMA = tuple((name, tuple(cols)) for name, cols in COLUMNS.items())
 
 def _create_tab(sh, name):
     ws = _retry(sh.add_worksheet, title=name, rows=2000, cols=len(COLUMNS[name]))
-    _retry(ws.update, [COLUMNS[name]], "A1")
+    seed = [[v] for v in _defaults().get(name, [])]          # new list tabs start with the default list
+    _retry(ws.update, [COLUMNS[name]] + seed, "A1")
     return ws
 
 
@@ -230,6 +241,8 @@ def _csv_path(name):
 def _csv_load(name):
     os.makedirs(DATA_DIR, exist_ok=True)
     p = _csv_path(name)
+    if not os.path.exists(p) and name in _defaults():
+        pd.DataFrame({COLUMNS[name][0]: _defaults()[name]}).to_csv(p, index=False)
     return pd.read_csv(p, dtype={"match_id": str}) if os.path.exists(p) else pd.DataFrame(columns=COLUMNS[name])
 
 
@@ -330,6 +343,7 @@ def rows_for(parsed, sides):
         "ball": meta.get("ball", ""),
         "venue": meta.get("venue", ""), "opponent": meta.get("opponent", ""), "outcome": meta.get("outcome", ""),
         "toss_result": meta.get("toss_result", ""), "innings": meta.get("innings", ""),
+        "coach": meta.get("coach", ""),
     }
     extra = {"match_id": meta["match_id"], "date": meta["date"], "type": match_type, "is_ours": True}
     bat = [{**b, **extra} for b in parsed["batting"] if ours(b["team"])]
@@ -486,6 +500,46 @@ def remove_ignored_pairs(pairs):
     keep = [frozenset((str(a), str(b))) not in drop
             for a, b in zip(df["name_a"].fillna(""), df["name_b"].fillna(""))]
     _overwrite("name_ignores", df[keep])
+
+
+# ---------------- editable lists: match formats, coaches ----------------
+def get_list(name):
+    """Values of a one-column list tab, in order, blanks and repeats removed (falls back to the defaults)."""
+    col = COLUMNS[name][0]
+    out = []
+    for v in load(name)[col].fillna("").astype(str):
+        v = " ".join(v.split())
+        if v and v.lower() != col.lower() and v not in out:
+            out.append(v)
+    return out or list(_defaults().get(name, []))
+
+
+def save_list(name, values):
+    vals = []
+    for v in values:
+        v = " ".join(str(v or "").split())
+        if v and v not in vals:
+            vals.append(v)
+    _overwrite(name, pd.DataFrame({COLUMNS[name][0]: vals}))
+
+
+def add_to_list(name, value):
+    value = " ".join(str(value or "").split())
+    if value and value.lower() not in {v.lower() for v in get_list(name)}:
+        _append(name, [{COLUMNS[name][0]: value}])
+        clear_cache()
+
+
+def rename_in_matches(field, old_values, new_value):
+    """Change a match field (format, coach, opponent) from any of old_values to new_value, in one write."""
+    m = load("matches")
+    hit = m[field].fillna("").astype(str).isin(set(old_values))
+    if hit.any():
+        m[field] = m[field].astype(object)
+        m.loc[hit, field] = new_value
+        _overwrite("matches", m)
+    clear_cache()
+    return int(hit.sum())
 
 
 # ---------------- squad list + remembered spellings ----------------
