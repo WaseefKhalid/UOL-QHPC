@@ -576,7 +576,7 @@ def list_png_cached(payload):
 def graphic_download(title, subtitle, rows, key, label="⬇️  Download graphic (PNG)"):
     """A download button for a branded PNG of a ranked list (same filters as the page)."""
     import json
-    payload = json.dumps({"title": title, "subtitle": subtitle,
+    payload = json.dumps({"v": ui.GRAPHICS_VERSION, "title": title, "subtitle": subtitle,
                           "rows": [[str(n), str(v), str(d)] for n, v, d in rows],
                           "scope": FILTER_NOTE or f"All matches from {ui.STATS_FROM}",
                           "footer_right": f"As of {dt.date.today():%d %b %Y}"})
@@ -596,7 +596,7 @@ def table_png_cached(payload):
 def table_download(title, subtitle, columns, rows, key, label):
     """A download button for a branded PNG of a leaderboard table (same filters as the page)."""
     import json
-    payload = json.dumps({"title": title, "subtitle": subtitle, "columns": columns,
+    payload = json.dumps({"v": ui.GRAPHICS_VERSION, "title": title, "subtitle": subtitle, "columns": columns,
                           "rows": [[str(v) for v in r] for r in rows],
                           "scope": FILTER_NOTE or f"All matches from {ui.STATS_FROM}",
                           "footer_right": f"As of {dt.date.today():%d %b %Y}"})
@@ -1109,7 +1109,8 @@ def render_profile(name, bat_f, field_f, bowl_f):
     with st.expander("📸  Player card — download and share"):
         import json
         mp = mvp_points()
-        png = card_png(json.dumps(build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts), default=str))
+        png = card_png(json.dumps({**build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts),
+                                   "v": ui.GRAPHICS_VERSION}, default=str))
         c1, c2 = st.columns([2, 3])
         c1.image(png, width="stretch")
         c2.markdown("A ready-made image of this player's stats for WhatsApp or Instagram. "
@@ -1376,17 +1377,13 @@ def top_performers(bat_f, bowl_f):
                  for _, r in cb.sort_values(["Runs", "SR"], ascending=[False, False]).head(n).iterrows()]
     top_inns = (bat_f.assign(_no=bat_f["how_out"] == "not out")
                 .sort_values(["runs", "_no", "balls"], ascending=[False, False, True]).head(n))
-    best_scores = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}",
-                    f"{int(r['balls'])} balls · {_when(r)}") for _, r in top_inns.iterrows()]
-    best_scores_g = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}",
-                      f"{int(r['balls'])} balls · {_when(r, False)}") for _, r in top_inns.iterrows()]
+    vs = lambda r: f"vs {r['opponent']}" if r["opponent"] else ""      # just the opposition, nothing else
+    best_scores = [(r["player"], f"{int(r['runs'])}{'*' if r['how_out'] == 'not out' else ''}", vs(r))
+                   for _, r in top_inns.iterrows()]
     most_wkts = [(r["Player"], int(r["Wkts"]), f"{r['Inns']} inns · avg {_num(r['Avg'])} · econ {_num(r['Econ'])}")
                  for _, r in cw[cw["Wkts"] > 0].sort_values(["Wkts", "Avg"], ascending=[False, True]).head(n).iterrows()]
     spells = bowl_f[bowl_f["wickets"] > 0].sort_values(["wickets", "runs"], ascending=[False, True]).head(n)
-    best_figs = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
-                  f"{r['overs']:g} ov · {_when(r)}") for _, r in spells.iterrows()]
-    best_figs_g = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}",
-                    f"{r['overs']:g} ov · {_when(r, False)}") for _, r in spells.iterrows()]
+    best_figs = [(r["player"], f"{int(r['wickets'])}/{int(r['runs'])}", vs(r)) for _, r in spells.iterrows()]
     q_sr = cb[(cb["Balls"] >= MIN_BALLS_FOR_SR) & cb["SR"].notna()]
     best_sr = [(r["Player"], f"{r['SR']:.2f}", f"{r['Runs']} runs · {r['Balls']} balls · {r['Inns']} inns")
                for _, r in q_sr.sort_values(["SR", "Runs"], ascending=False).head(n).iterrows()]
@@ -1400,7 +1397,7 @@ def top_performers(bat_f, bowl_f):
     st.caption("Each list has a download button for a ready-to-share graphic.")
     batting = [
         ("Most runs", "Batting", most_runs, "Batting", None),
-        ("Highest scores", "Single innings", best_scores, "Highest single-innings scores", best_scores_g),
+        ("Highest scores", "Single innings", best_scores, "Highest single-innings scores", None),
         ("Best batting average", f"Min {MIN_INNS_FOR_AVG} innings", bat_avg,
          f"Batting average · min {MIN_INNS_FOR_AVG} innings", None),
         ("Highest strike rate", f"Min {MIN_BALLS_FOR_SR} balls", best_sr,
@@ -1408,7 +1405,7 @@ def top_performers(bat_f, bowl_f):
     ]
     bowling = [
         ("Most wickets", "Bowling", most_wkts, "Bowling", None),
-        ("Best bowling figures", "Single innings", best_figs, "Best figures in an innings", best_figs_g),
+        ("Best bowling figures", "Single innings", best_figs, "Best figures in an innings", None),
         ("Best bowling average", f"Min {MIN_WKTS_FOR_AVG} wickets", bowl_avg,
          f"Bowling average · min {MIN_WKTS_FOR_AVG} wickets", None),
     ]
