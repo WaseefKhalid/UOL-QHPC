@@ -12,6 +12,7 @@ INK, MUTED, LINE = "#1C2B25", "#5E6E66", "#D3E6DB"
 ORG = "UOL · Qalandars High Performance Centre"
 APP = "UOL QHPC Cricket Stats"
 STATS_FROM = "28 October 2026"   # shown at the top of every page
+GRAPHICS_VERSION = "4"   # bump when the PNG layouts change, so no old cached image is served
 LOGO = os.path.join(os.path.dirname(__file__), "assets", "logo.png")  # optional: drop your logo here
 
 CSS = f"""
