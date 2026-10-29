@@ -608,37 +608,6 @@ def add_to_squad(names):
     return len(new)
 
 
-def move_player_rows(wrong, correct, match_ids):
-    """Move one player's entries in the chosen matches to another player (a wrong name link).
-    Only those matches change; the player's other matches stay as they are. One read and one write
-    per tab. Returns {tab: rows moved}."""
-    ids = {str(m) for m in match_ids}
-    wrong, correct = str(wrong), str(correct)
-    moved = {}
-    if not ids or not wrong.strip() or not correct.strip() or wrong == correct:
-        return moved
-    # batting also names him as bowler/fielder on older rows (same columns rename_many updates)
-    for name, cols in (("batting", ("player", "bowler", "fielder")), ("bowling", ("player",)),
-                       ("fielding", ("player",))):
-        df = load(name)
-        if df.empty:
-            continue
-        in_match = df["match_id"].astype(str).isin(ids)
-        n = 0
-        for col in cols:
-            if col not in df:
-                continue
-            hit = in_match & (df[col].fillna("").astype(str) == wrong)
-            if hit.any():
-                df.loc[hit, col] = correct
-                n += int(hit.sum())
-        if n:
-            _overwrite(name, df)
-            moved[name] = n
-    clear_cache()
-    return moved
-
-
 def relink_names(pairs, remember=None, new_players=()):
     """Rename saved players to their squad-list full names in one pass: {saved name: full name}.
     new_players are typed full names to add to the squad tab first."""
