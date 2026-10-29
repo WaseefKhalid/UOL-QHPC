@@ -19,7 +19,8 @@ st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout
 
 # All five .py files must be from the same update. If one wasn't replaced on GitHub, say which one
 # instead of crashing with a confusing error.
-_NEEDS = {"db.py": (db, ["get_list", "add_to_list", "rename_in_matches", "relink_names", "rename_many"]),
+_NEEDS = {"db.py": (db, ["get_list", "add_to_list", "rename_in_matches", "relink_names", "rename_many",
+                         "move_player_rows"]),
           "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points"]),
           "ui.py": (ui, ["table_png", "list_png", "GRAPHICS_VERSION", "fonts_installed"]),
           "parser.py": (_parser, ["parse_stumps_pdf", "parse_summary_image"])}
@@ -1941,6 +1942,96 @@ def lists_section(matches):
 
 
 @st.fragment
+def fix_link_section(bat_all, bowl_all, field_all):
+    st.subheader("Fix a wrong player link")
+    st.caption("Saved a match under the wrong player? For example “Daniyal” was linked to Daniyal Iftikhar but it "
+               "was really Daniyal Nadeem. Pick the name it was saved under, tick the wrong match(es), choose who it "
+               "really was, and apply. Only the ticked matches move — that player's other matches stay as they are.")
+    flash("fix_done")
+    everyone = sorted(set(bat_all["player"]) | set(bowl_all["player"]) | set(field_all["player"]))
+    if not everyone:
+        st.caption("No players yet.")
+        return
+    wrong = st.selectbox("1 · Saved under (the wrong name)", everyone, index=None, key="fix_wrong",
+                         placeholder="Pick the player…")
+    if not wrong:
+        return
+    h = short_hash(wrong)
+
+    def mine(df, kind):
+        d = df[df["player"] == wrong].copy()
+        if "scorecard_name" not in d:
+            d["scorecard_name"] = ""
+        return d.assign(kind=kind)
+    rows = pd.concat([mine(bat_all, "bat"), mine(bowl_all, "bowl"), mine(field_all, "field")], ignore_index=True)
+    if rows.empty:
+        st.caption("No saved entries for this player.")
+        return
+    out = []
+    for mid, g in rows.groupby("match_id", sort=False):
+        b, w, f = g[g["kind"] == "bat"], g[g["kind"] == "bowl"], g[g["kind"] == "field"]
+        sc = sorted({_text(x) for x in g["scorecard_name"]} - {"", "nan"})
+        bat_txt = ", ".join(f"{_int(r.runs)}{'*' if _text(r.how_out).lower() == 'not out' else ''} ({_int(r.balls)})"
+                            for r in b.itertuples())
+        bowl_txt = ", ".join(f"{_int(r.wickets)}/{_int(r.runs)}" for r in w.itertuples())
+        out.append({"Wrong?": False, "date_dt": g["date_dt"].iloc[0], "Opponent": _text(g["opponent"].iloc[0]) or "—",
+                    "Scorecard said": ", ".join(sc) or "—", "Batting": bat_txt or "—", "Bowling": bowl_txt or "—",
+                    "Catches": len(f), "match_id": str(mid), "names": sc})
+    table = pd.DataFrame(out).sort_values("date_dt", ascending=False, na_position="last").reset_index(drop=True)
+    table.insert(1, "Date", fmt_date(pd.to_datetime(table["date_dt"])))
+    st.markdown(f"**2 · Tick the match(es) that were not really {wrong}** · {len(table)} saved match(es)")
+    ed = st.data_editor(table[["Wrong?", "Date", "Opponent", "Scorecard said", "Batting", "Bowling", "Catches"]],
+                        hide_index=True, width="stretch", key=f"fix_ed_{h}",
+                        disabled=["Date", "Opponent", "Scorecard said", "Batting", "Bowling", "Catches"],
+                        column_config={"Wrong?": st.column_config.CheckboxColumn("Wrong?", width="small"),
+                                       "Catches": st.column_config.NumberColumn("Catches", width="small")})
+    picked = table[ed["Wrong?"].fillna(False).astype(bool).values]
+    if picked.empty:
+        st.caption("Nothing ticked yet.")
+        return
+    sc_names = sorted({n for names in picked["names"] for n in names})
+    squad = db.squad_names()
+    opts = [p for p in dict.fromkeys(squad + everyone) if p != wrong]
+    st.markdown("**3 · Who it really was**")
+    c1, c2 = st.columns([3, 2], vertical_alignment="top")
+    kind, correct = pick_player(sc_names[0] if sc_names else wrong.split()[0], opts, None, f"fix_to_{h}", c1)
+    if kind == "guest":
+        kind, correct = None, None
+        c1.caption("Pick the right player from the list, or “New player” to type their full name.")
+    remember = False
+    if sc_names:
+        remember = c2.checkbox(f"From now on, “{' / '.join(sc_names)}” on a scorecard means {correct or '…'}",
+                               value=True, key=f"fix_rem_{h}", disabled=not correct,
+                               help="Updates the remembered spelling, so the next upload suggests the right player. "
+                                    "If two squad players fit that name you are still asked each time — this just "
+                                    "changes which one is pre-selected.")
+    if not correct:
+        return
+    st.caption(f"{len(picked)} match(es) will move from **{wrong}** to **{correct}**: "
+               + "; ".join(f"{d} vs {o}" for d, o in zip(picked["Date"], picked["Opponent"])))
+    if st.button(f"✅  Move to {correct}", type="primary", key=f"fix_go_{h}"):
+        import gspread
+        try:
+            with st.spinner("Updating the saved matches…"):
+                if kind == "new":
+                    db.add_to_squad([correct])
+                moved = db.move_player_rows(wrong, correct, picked["match_id"].tolist())
+                if remember:
+                    db.save_spellings({n: (correct, True) for n in sc_names})
+        except gspread.exceptions.APIError:
+            st.error("Google Sheets is busy (too many changes in a minute). Wait a minute and press the button "
+                     "again — nothing is lost.")
+            return
+        msg = f"Moved {len(picked)} match(es) from {wrong} to {correct}."
+        if moved.get("bowling") and correct not in db.bowling_types():
+            msg += f" {correct} has no bowling type yet — set pace or spin under “Bowling types” below."
+        st.session_state["fix_done"] = msg
+        for k in ("fix_wrong", f"fix_ed_{h}", f"fix_to_{h}", f"fix_to_{h}_new", f"fix_rem_{h}"):
+            st.session_state.pop(k, None)
+        st.rerun(scope="app")
+
+
+@st.fragment
 def squad_section(players):
     st.subheader("Squad list — full names")
     st.caption("Your squad list lives in your Google Sheet: tab **squad**, column **Full name**, one player per "
@@ -2119,6 +2210,8 @@ def merge_full_list(players, bat_all, bowl_all):
 if IS_ADMIN:
     with TABS["manage"]:
         squad_section(players)
+        st.divider()
+        fix_link_section(bat_all, bowl_all, field_all)
         st.divider()
         lists_section(matches)
         st.divider()
