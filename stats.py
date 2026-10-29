@@ -17,7 +17,9 @@ OUTCOMES = ("Won", "Lost", "Tied", "Drawn", "No result")
 INTRA = "Intra-squad"
 FORMAT_CHOICES = ["Inter Academy Senior Team Match", "Inter Academy Junior Team Match",
                   "Intra Academy Senior Match", "Intra Academy Junior Match",
+                  "Group C Junior Inter Academy Match", "Group C Junior Intra Academy Match",
                   "PCB Official Club Cricket Match"]
+COACHES = ["Kashif Raza", "Waseem Khan", "Shahab Khan", "Amjad Ali", "Shoaib Khattak", "Shabbir"]
 
 
 def overs_from_scorecard(meta):
@@ -289,6 +291,7 @@ def match_table(m_df):
     col = lambda c: (m[c] if c in m else pd.Series("", index=m.index)).fillna("").astype(str).str.strip()
     m["ball_label"] = col("ball").where(lambda b: b.isin(BALLS), NOT_SET)
     m["venue_label"] = col("venue").where(lambda v: v.isin(VENUES), NOT_SET)
+    m["coach_label"] = col("coach").map(lambda c: " ".join(c.split()) or NOT_SET)
 
     sides, opps, ours, theirs, outcomes, tosses, inns = [], [], [], [], [], [], []
     for r, opp, out, tos, inn in zip(m.to_dict("records"), col("opponent"), col("outcome"),
