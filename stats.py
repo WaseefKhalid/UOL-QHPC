@@ -20,6 +20,42 @@ FORMAT_CHOICES = ["Inter Academy Senior Team Match", "Inter Academy Junior Team 
                   "Group C Junior Inter Academy Match", "Group C Junior Intra Academy Match",
                   "PCB Official Club Cricket Match"]
 COACHES = ["Kashif Raza", "Waseem Khan", "Shahab Khan", "Amjad Ali", "Shoaib Khattak", "Shabbir"]
+MAX_COACHES = 2            # coaches who can share one match
+COACH_SEP = " & "          # how two coaches are written in the sheet: "Kashif Raza & Waseem Khan"
+_COACH_SPLIT = re.compile(r"\s*(?:&|,|/|;|\+|\band\b)\s*", re.I)
+
+
+def split_coaches(text):
+    """'Kashif Raza & Waseem Khan' -> ['Kashif Raza', 'Waseem Khan']. Also accepts , / ; + or 'and'
+    (for names typed straight into the sheet). Repeats dropped, order kept."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return []
+    if not isinstance(text, str):                       # a list from a multiselect
+        parts = [str(x) for x in text]
+    else:
+        parts = _COACH_SPLIT.split(text)
+    out = []
+    for p in parts:
+        p = " ".join(str(p).split())
+        if p and p.lower() not in {o.lower() for o in out}:
+            out.append(p)
+    return out
+
+
+def join_coaches(names):
+    """['Kashif Raza', 'Waseem Khan'] -> 'Kashif Raza & Waseem Khan' (the text saved in the sheet)."""
+    return COACH_SEP.join(split_coaches(names if not isinstance(names, str) else [names]))
+
+
+def explode_coaches(m):
+    """One row per coach per match (a match with two coaches appears once for each), with columns
+    `coach_one` and `n_coaches`. Matches without a coach are left out."""
+    rows = m[m["coach_label"] != NOT_SET].copy()
+    lists = rows["coach_label"].map(split_coaches)
+    rows["n_coaches"] = lists.map(len)
+    rows["coach_one"] = lists
+    rows = rows.explode("coach_one")
+    return rows[rows["coach_one"].notna() & (rows["coach_one"] != "")].reset_index(drop=True)
 
 
 def overs_from_scorecard(meta):
@@ -291,7 +327,7 @@ def match_table(m_df):
     col = lambda c: (m[c] if c in m else pd.Series("", index=m.index)).fillna("").astype(str).str.strip()
     m["ball_label"] = col("ball").where(lambda b: b.isin(BALLS), NOT_SET)
     m["venue_label"] = col("venue").where(lambda v: v.isin(VENUES), NOT_SET)
-    m["coach_label"] = col("coach").map(lambda c: " ".join(c.split()) or NOT_SET)
+    m["coach_label"] = col("coach").map(lambda c: join_coaches(split_coaches(c)) or NOT_SET)
 
     sides, opps, ours, theirs, outcomes, tosses, inns = [], [], [], [], [], [], []
     for r, opp, out, tos, inn in zip(m.to_dict("records"), col("opponent"), col("outcome"),
