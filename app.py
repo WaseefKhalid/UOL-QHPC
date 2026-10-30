@@ -21,7 +21,7 @@ st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout
 # instead of crashing with a confusing error.
 _NEEDS = {"db.py": (db, ["get_list", "add_to_list", "rename_in_matches", "relink_names", "rename_many",
                          "move_player_rows"]),
-          "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points"]),
+          "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points", "split_coaches"]),
           "ui.py": (ui, ["table_png", "list_png", "GRAPHICS_VERSION", "fonts_installed"]),
           "parser.py": (_parser, ["parse_stumps_pdf", "parse_summary_image"])}
 _old = [f for f, (mod, names) in _NEEDS.items() if any(not hasattr(mod, n) for n in names)]
@@ -42,7 +42,7 @@ from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CH
                    guess_type, career_batting, career_bowling, batting_by_position, player_overview,
                    enrich, filter_rows, suggest_name_groups, search_names, team_matches, default_side,
                    team_key, duplicate_evidence, match_proof, batting_proof, find_duplicate_matches,
-                   match_source, DUP_LABELS)
+                   match_source, DUP_LABELS, split_coaches, join_coaches, explode_coaches, MAX_COACHES)
 
 
 ui.apply_theme()
@@ -177,17 +177,16 @@ def show_proof(a, b, label_a, label_b, bat_a, bat_b, reasons, bowl_a=None, bowl_
 
 TYPE_OTHER = "✏️ Type another name…"
 FMT_OTHER = "Other…"
-COACH_OTHER = "✏️ Another coach…"
 
 
 def _fill_coaches(key):
-    """When a coach is picked on one card, pre-fill every card in this upload that has no coach yet."""
+    """When coaches are picked on one card, pre-fill every card in this upload that has none yet."""
     v = st.session_state.get(key)
-    if not v or v == COACH_OTHER:
+    if not v:
         return
     for k in st.session_state.get("coach_keys", set()):
-        if k != key and st.session_state.get(k) is None:
-            st.session_state[k] = v
+        if k != key and not st.session_state.get(k):
+            st.session_state[k] = list(v)
 
 
 def match_details(fk, mt, side, labels, known_opps, known_formats):
@@ -250,25 +249,26 @@ def match_details(fk, mt, side, labels, known_opps, known_formats):
                                      index=INNINGS.index(gi) if gi else None)
         if gi and d["innings"] == gi:
             cols[3].caption("From the scorecard")
-    cols = st.columns(4)
-    last = st.session_state.get("last_coach")
-    coach_opts = list(COACH_LIST) + [COACH_OTHER]
+    cols = st.columns([2, 2])
     ck = f"coach_{fk}"
     st.session_state.setdefault("coach_keys", set()).add(ck)
-    if ck not in st.session_state:          # start from the coach picked last (set through state, not index)
-        st.session_state[ck] = last if last in coach_opts else None
-    coach = cols[0].selectbox("Coach", coach_opts, key=ck, placeholder="Pick the coach…",
-                              on_change=_fill_coaches, args=(ck,),
-                              help="Picking a coach fills the other matches in this upload too — change any that differ.")
-    if coach == COACH_OTHER:
-        coach = " ".join(cols[0].text_input("Coach name", key=f"coacht_{fk}", placeholder="Type the coach's name",
-                                            label_visibility="collapsed").split())
-        if coach:
-            d["new_coach"] = coach
-            cols[0].caption("Will be added to your coach list")
-    if coach:
-        st.session_state["last_coach"] = coach
-    d["coach"] = coach or ""
+    if ck not in st.session_state:          # start from the coach(es) picked last (set through state, not default)
+        st.session_state[ck] = split_coaches(st.session_state.get("last_coach"))
+    coaches = cols[0].multiselect(
+        f"Coach (up to {MAX_COACHES})", list(COACH_LIST), key=ck, max_selections=MAX_COACHES,
+        accept_new_options=True, placeholder="Pick the coach — or two if they shared the match…",
+        on_change=_fill_coaches, args=(ck,),
+        help="Two coaches supervised? Pick both — the match counts for each of them in the Coaches tab. "
+             "Not in the list? Type the name and press Enter. Picking here fills the other matches in this "
+             "upload too — change any that differ.")
+    coaches = split_coaches(coaches)
+    new = [c for c in coaches if c.lower() not in {x.lower() for x in COACH_LIST}]
+    if new:
+        d["new_coach"] = new
+        cols[0].caption(f"Will be added to your coach list: {', '.join(new)}")
+    if coaches:
+        st.session_state["last_coach"] = coaches
+    d["coach"] = join_coaches(coaches)
     need = (["opponent", "venue", "outcome", "toss_result", "innings"] if normal else []) + ["format", "overs", "ball",
                                                                                          "coach"]
     d["missing"] = [k for k in need if not d.get(k)]
@@ -1041,8 +1041,8 @@ if IS_ADMIN:
                     for _c, _a, _s, _d in live:
                         if _d.get("new_format"):
                             db.add_to_list("formats", _d["new_format"])
-                        if _d.get("new_coach"):
-                            db.add_to_list("coaches", _d["new_coach"])
+                        for _nc in dict.fromkeys(_d.get("new_coach") or []):
+                            db.add_to_list("coaches", _nc)
                     nb, nw = db.append_many(to_save, names=name_map)
                     db.save_spellings(name_memory)
                 skipped = len(cards) - len(to_save)
@@ -1091,7 +1091,8 @@ if IS_ADMIN:
             m_toss = mc9.radio("Toss", list(TOSSES), index=None, horizontal=True, key="m_toss",
                                format_func=lambda t: f"{t} toss")
             m_inn = mc10.radio("Our innings", list(INNINGS), index=None, horizontal=True, key="m_inn")
-            m_coach = mc11.selectbox("Coach", list(COACH_LIST), index=None, key="m_coach", placeholder="Pick the coach…")
+            m_coach = join_coaches(mc11.multiselect(f"Coach (up to {MAX_COACHES})", list(COACH_LIST), key="m_coach",
+                                                    max_selections=MAX_COACHES, placeholder="Pick 1 or 2…"))
 
             st.markdown("**Your batting** (one row per batter, in batting order)")
             bat_tmpl = pd.DataFrame([{"player": "", "runs": 0, "balls": 0, "fours": 0, "sixes": 0,
@@ -1657,7 +1658,7 @@ if IS_ADMIN:
                 "Result": [o if o in OUTCOMES else None for o in mv["outcome_label"]],
                 "Toss": [t if t in TOSSES else None for t in mv["toss_label"]],
                 "Innings": [i if i in INNINGS else None for i in mv["innings_label"]],
-                "Coach": [c if c != NOT_SET else None for c in mv["coach_label"]],
+                "Coach": [split_coaches(c) if c != NOT_SET else [] for c in mv["coach_label"]],
                 "Format": [f or None for f in mv["format"]],
                 "Overs": pd.to_numeric(mv["overs"], errors="coerce"),
                 "Ball": [b if b in BALLS else None for b in mv["ball_label"]],
@@ -1665,8 +1666,8 @@ if IS_ADMIN:
             }).reset_index(drop=True)
             ids = mv["match_id"].tolist()
             st.caption("Opponent, venue, result, toss, innings, coach, format, overs and ball can be changed here "
-                       "any time: edit the cells, then press Save. New formats or coaches? Add them in "
-                       "🛠 Manage → Lists first.")
+                       f"any time: edit the cells, then press Save. Coach: pick one, or two if they shared the "
+                       f"match (up to {MAX_COACHES}). New formats or coaches? Add them in 🛠 Manage → Lists first.")
             edit_cols = {"Opponent": "opponent", "Venue": "venue", "Result": "outcome", "Toss": "toss_result",
                          "Innings": "innings", "Coach": "coach", "Format": "format", "Overs": "overs", "Ball": "ball"}
             edited = st.data_editor(
@@ -1677,23 +1678,33 @@ if IS_ADMIN:
                     "Result": st.column_config.SelectboxColumn("Result", options=list(OUTCOMES)),
                     "Toss": st.column_config.SelectboxColumn("Toss", options=list(TOSSES)),
                     "Innings": st.column_config.SelectboxColumn("Innings", options=list(INNINGS)),
-                    "Coach": st.column_config.SelectboxColumn(
-                        "Coach", options=list(dict.fromkeys(COACH_LIST + [c for c in mv["coach_label"] if c != NOT_SET]))),
+                    "Coach": st.column_config.MultiselectColumn(
+                        "Coach", options=list(dict.fromkeys(COACH_LIST + [x for c in table["Coach"] for x in c])),
+                        help=f"One coach, or two if they shared the match (up to {MAX_COACHES})."),
                     "Format": st.column_config.SelectboxColumn(
                         "Format", options=list(dict.fromkeys(FORMATS + known_formats))),
                     "Overs": st.column_config.NumberColumn("Overs", min_value=1, max_value=200, step=1),
                     "Ball": st.column_config.SelectboxColumn("Ball", options=list(BALLS))})
-            changes = {}
+            changes, too_many = {}, []
             for i, mid in enumerate(ids):
                 for col, field in edit_cols.items():
                     old, new = table.at[i, col], edited.at[i, col]
+                    if col == "Coach":          # a list of 0-2 names
+                        old_c, new_c = join_coaches(split_coaches(old)), split_coaches(new)
+                        if len(new_c) > MAX_COACHES:
+                            too_many.append(table.at[i, "Date"])
+                        elif new_c and join_coaches(new_c) != old_c:
+                            changes.setdefault(mid, {})["coach"] = join_coaches(new_c)
+                        continue
                     if col in ("Opponent", "Toss", "Innings") and (not normal[i] or not str(new or "").strip()):
                         continue
                     if pd.notna(new) and not (pd.notna(old) and new == old) and str(new).strip():
                         changes.setdefault(mid, {})[field] = (str(int(new)) if col == "Overs"
                                                               else str(new).strip())
             n_changes = sum(len(v) for v in changes.values())
-            if st.button(f"💾  Save {n_changes} change(s)", disabled=not changes, key="m_ed_save"):
+            if too_many:
+                st.warning(f"A match can have up to {MAX_COACHES} coaches — remove one from: {', '.join(too_many)}.")
+            if st.button(f"💾  Save {n_changes} change(s)", disabled=not changes or bool(too_many), key="m_ed_save"):
                 db.update_matches(changes)
                 st.session_state["ball_done"] = f"Updated {len(changes)} match(es)."
                 st.rerun()
@@ -1720,21 +1731,27 @@ def coach_analysis(m):
         st.info("No matches with a coach yet. Pick the coach when uploading, or add it to saved matches in "
                 "the 📋 Matches tab.")
         return
-    table = record_table(with_coach, "coach_label", "Coach")
+    each = explode_coaches(with_coach)               # a shared match counts once for each of its coaches
+    shared = with_coach[with_coach["coach_label"].map(lambda c: len(split_coaches(c)) > 1)]
+    table = record_table(each, "coach_one", "Coach")
+    n_shared = each[each["n_coaches"] > 1].groupby("coach_one").size()
+    table.insert(2, "Shared", table["Coach"].map(n_shared).fillna(0).astype(int))
     best = table[table["P"] > 0].sort_values(["Win %", "P"], ascending=False).iloc[0]
     ui.cards([
-        ("Coaches", len(table), f"{len(with_coach)} match(es) with a coach"),
+        ("Coaches", len(table), f"{len(with_coach)} match(es) with a coach"
+                                + (f" · {len(shared)} shared" if len(shared) else "")),
         ("Best win %", f"{best['Win %']:.0f}%" if pd.notna(best["Win %"]) else "—",
          f"{best['Coach']} · {best['W']} won of {best['P']}"),
         ("Most matches", int(table["P"].max()), table.sort_values("P", ascending=False).iloc[0]["Coach"]),
     ])
     ui.section("01", "Win / loss by coach")
-    st.caption("Intra-squad games aren't counted. Win % = won ÷ matches with a result.")
+    st.caption("Intra-squad games aren't counted. Win % = won ÷ matches with a result. A match two coaches "
+               "supervised together counts for both of them — **Shared** shows how many of their matches that was.")
     show_table(table, "coach_rec", result_col="Last result", mobile_cols=["Coach"] + REC_MOBILE)
 
     ui.section("02", "Coach by match format")
     rows = []
-    for (coach, fmt), g in with_coach.groupby(["coach_label", "format_label"]):
+    for (coach, fmt), g in each.groupby(["coach_one", "format_label"]):
         r = team_record(g)
         rows.append({"Coach": coach, "Format": fmt, "P": r["Played"], "W": r["Won"], "L": r["Lost"],
                      "D/T/NR": r["Drawn"] + r["Tied"] + r["No result"], "Win %": r["Win %"]})
@@ -1743,11 +1760,21 @@ def coach_analysis(m):
     show_table(by_fmt.sort_values(["Coach", "P"], ascending=[True, False]), "coach_fmt",
                mobile_cols=["Coach", "Format", "P", "Win %"])
 
-    ui.section("03", "One coach in detail")
+    sec = 3
+    if not shared.empty:
+        ui.section("03", "Coaching pairs")
+        st.caption("Matches two coaches supervised together, by pair.")
+        show_table(record_table(shared, "coach_label", "Coaches"), "coach_pairs", result_col="Last result",
+                   mobile_cols=["Coaches"] + REC_MOBILE)
+        sec = 4
+
+    ui.section(f"{sec:02d}", "One coach in detail")
     pick = st.selectbox("Coach", table["Coach"].tolist(), key="coach_pick")
-    g = with_coach[with_coach["coach_label"] == pick].sort_values("date_dt", na_position="first")
+    g = each[each["coach_one"] == pick].sort_values("date_dt", na_position="first")
     r = team_record(g)
-    ui.cards([("Played", r["Played"], ""), ("Won", r["Won"], ""), ("Lost", r["Lost"], ""),
+    n_sh = int((g["n_coaches"] > 1).sum())
+    ui.cards([("Played", r["Played"], f"{n_sh} shared" if n_sh else "none shared"), ("Won", r["Won"], ""),
+              ("Lost", r["Lost"], ""),
               ("Win %", f"{r['Win %']:.0f}%" if r["Win %"] is not None else "—", "of games with a result")],
              small=True)
     st.markdown("**Recent form** — oldest to latest")
@@ -1760,10 +1787,13 @@ def coach_analysis(m):
         show_table(record_table(g, "ball_label", "Ball").drop(columns=["Last result"]), "coach_ball",
                    mobile_cols=["Ball"] + REC_MOBILE)
     gg = g.sort_values("date_dt", ascending=False, na_position="last")
-    show_table(pd.DataFrame({
+    games_tbl = pd.DataFrame({
         "Date": fmt_date(gg["date_dt"]), "Opponent": gg["opponent_label"], "Format": gg["format_label"],
-        "Venue": gg["venue_label"], "Result": gg["outcome_label"], "Margin": gg["result"]}), "coach_games",
-        result_col="Result", mobile_cols=["Date", "Opponent", "Result"])
+        "Venue": gg["venue_label"], "Result": gg["outcome_label"], "Margin": gg["result"],
+        "With": [", ".join(x for x in split_coaches(c) if x != pick) or "—" for c in gg["coach_label"]]})
+    if not n_sh:
+        games_tbl = games_tbl.drop(columns=["With"])
+    show_table(games_tbl, "coach_games", result_col="Result", mobile_cols=["Date", "Opponent", "Result"])
 
 
 if IS_ADMIN:
@@ -1930,6 +1960,8 @@ def lists_section(matches):
     field = c1.selectbox("What", ["Format", "Coach"], key="ren_field")
     col = "format" if field == "Format" else "coach"
     used = matches[col].fillna("").astype(str).str.strip()
+    if col == "coach":                    # count each coach on his own, shared matches included
+        used = used.map(split_coaches).explode().dropna().astype(str)
     counts = used[used != ""].value_counts()
     olds = c2.multiselect(f"Saved {field.lower()}(s)", counts.index.tolist(), key=f"ren_old_{col}",
                           format_func=lambda v: f"{v} ({counts[v]})")
