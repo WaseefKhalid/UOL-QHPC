@@ -533,6 +533,19 @@ def add_to_list(name, value):
 def rename_in_matches(field, old_values, new_value):
     """Change a match field (format, coach, opponent) from any of old_values to new_value, in one write."""
     m = load("matches")
+    if field == "coach":                 # a match can have two coaches: change the name inside "A & B" too
+        from stats import split_coaches, join_coaches
+        olds = {str(o).lower() for o in old_values}
+        before = m["coach"].fillna("").astype(str)
+        after = before.map(lambda c: join_coaches([new_value if x.lower() in olds else x for x in split_coaches(c)])
+                           if any(x.lower() in olds for x in split_coaches(c)) else c)
+        hit = after != before
+        if hit.any():
+            m["coach"] = m["coach"].astype(object)
+            m.loc[hit, "coach"] = after[hit]
+            _overwrite("matches", m)
+        clear_cache()
+        return int(hit.sum())
     hit = m[field].fillna("").astype(str).isin(set(old_values))
     if hit.any():
         m[field] = m[field].astype(object)
