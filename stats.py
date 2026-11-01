@@ -857,7 +857,10 @@ def match_points(bat, bowl, field):
             "line_bat", "line_bowl", "catches", "runs", "wickets"]
     if not frames:
         return pd.DataFrame(columns=cols)
-    allr = pd.concat(frames, ignore_index=True)
+    # a filter can leave no catches (or no batting / bowling) at all: make sure every column exists
+    allr = pd.concat(frames, ignore_index=True).reindex(
+        columns=["match_id", "player", "date_dt", "opponent", "bat_pts", "bowl_pts", "field_pts", "catches",
+                 "runs", "wickets", "line_bat", "line_bowl"])
     g = allr.groupby(["match_id", "player"], sort=False)
     out = g.agg(date_dt=("date_dt", "first"), opponent=("opponent", "first"),
                 bat_pts=("bat_pts", "sum"), bowl_pts=("bowl_pts", "sum"), field_pts=("field_pts", "sum"),
