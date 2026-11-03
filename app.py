@@ -21,7 +21,8 @@ st.set_page_config(page_title="UOL QHPC Cricket Stats", page_icon="🏏", layout
 # instead of crashing with a confusing error.
 _NEEDS = {"db.py": (db, ["get_list", "add_to_list", "rename_in_matches", "relink_names", "rename_many",
                          "move_player_rows"]),
-          "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points", "split_coaches"]),
+          "stats.py": (_stats, ["COACHES", "FORMAT_CHOICES", "resolve_name", "match_points", "split_coaches",
+                                "MATCH_KINDS"]),
           "ui.py": (ui, ["table_png", "list_png", "GRAPHICS_VERSION", "fonts_installed"]),
           "parser.py": (_parser, ["parse_stumps_pdf", "parse_summary_image"])}
 _old = [f for f, (mod, names) in _NEEDS.items() if any(not hasattr(mod, n) for n in names)]
@@ -33,7 +34,7 @@ if _old:
     st.stop()
 
 from parser import parse_stumps_pdf, parse_summary_image
-from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, FORMAT_CHOICES, guess_ball,
+from stats import (NO_FORMAT, NOT_SET, BALLS, VENUES, OUTCOMES, INTRA, MATCH_KINDS, FORMAT_CHOICES, guess_ball,
                    TOSSES, INNINGS, guess_toss, guess_innings, POINTS_RULES, match_points,
                    players_of_match, mvp_table, dismissal_breakdown, HOW_OUT_LABELS,
                    resolve_name, clean_scorecard_name, GUEST,
@@ -412,7 +413,8 @@ bowl_all["bowl_type"] = bowl_all["player"].map(types).fillna(NOT_SET)
 
 # ---------------- Sidebar: store status + filters ----------------
 PERIODS = ["All time", "Last 7 days", "Last 30 days", "Last 3 months", "This year", "Custom range"]
-FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_ball", "f_venue", "f_inn", "f_formats", "f_pos", "f_btype"]
+FILTER_KEYS = ["f_period", "f_range", "f_undated", "f_kind", "f_ball", "f_venue", "f_inn", "f_formats", "f_pos",
+               "f_btype"]
 
 
 def reset_filters():
@@ -480,6 +482,11 @@ with st.sidebar:
         include_undated = st.checkbox(f"Also include {n_undated} undated match(es)", value=False,
                                       key="f_undated", help="Screenshot uploads don't carry a date.")
 
+    # against other teams / intra-squad
+    kind_sel = st.multiselect("Match type", list(MATCH_KINDS), key="f_kind", placeholder="All matches",
+                              help="Intra-squad = both sides were our players. Works whatever format the "
+                                   "match is saved under.")
+
     # white ball / red ball
     ball_opts = list(BALLS) + ([NOT_SET] if (matches["ball_label"] == NOT_SET).any() else [])
     if "f_ball" in st.session_state:
@@ -522,8 +529,8 @@ with st.sidebar:
                                help="Applies to bowling stats only.")
 
     m_view = filter_rows(matches, date_range, include_undated, fmt_sel, balls=ball_sel, venues=venue_sel,
-                         innings=inn_sel)
-    if date_range or ball_sel or venue_sel or inn_sel or fmt_sel or pos_sel or btype_sel:
+                         innings=inn_sel, kinds=kind_sel)
+    if date_range or kind_sel or ball_sel or venue_sel or inn_sel or fmt_sel or pos_sel or btype_sel:
         st.caption(f"Showing **{len(m_view)}** of {len(matches)} matches")
         st.button("↺  Reset filters", on_click=reset_filters)
 
@@ -546,7 +553,7 @@ with st.sidebar:
 # rows after filters (fielding isn't filtered by batting position: a catch has nothing
 # to do with where the catcher batted)
 common = dict(date_range=date_range, include_undated=include_undated, formats=fmt_sel, balls=ball_sel,
-              venues=venue_sel, innings=inn_sel)
+              venues=venue_sel, innings=inn_sel, kinds=kind_sel)
 bat_base = filter_rows(bat_all, **common)
 bat_f = filter_rows(bat_base, positions=pos_sel)
 bowl_base = filter_rows(bowl_all, **common)
@@ -556,6 +563,8 @@ field_f = filter_rows(field_all, **common)
 note_parts = []
 if date_range:
     note_parts.append(f"{date_range[0]:%d %b %Y} – {date_range[1]:%d %b %Y}")
+if len(kind_sel) == 1:
+    note_parts.append("intra-squad matches" if kind_sel[0] == INTRA else "matches vs other teams")
 if ball_sel:
     note_parts.append(" & ".join(ball_sel))
 if venue_sel:
