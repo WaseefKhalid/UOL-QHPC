@@ -368,7 +368,7 @@ def match_table(m_df):
     return m
 
 
-FIELD_COLS = ["match_id", "date", "type", "team", "player", "dismissal"]
+FIELD_COLS = ["match_id", "date", "type", "team", "player", "dismissal", "scorecard_name"]
 FIELDING_DISMISSALS = ("caught", "caught & bowled", "stumped", "run out")
 
 
