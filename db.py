@@ -621,30 +621,59 @@ def add_to_squad(names):
     return len(new)
 
 
-def move_player_rows(wrong, correct, match_ids):
-    """Move one player's entries in the chosen matches to another player (a wrong name link).
-    Only those matches change; the player's other matches stay as they are. One read and one write
-    per tab. Returns {tab: rows moved}."""
-    ids = {str(m) for m in match_ids}
+def _norm(v):
+    v = "" if v is None or (isinstance(v, float) and pd.isna(v)) else " ".join(str(v).split())
+    return "" if v.lower() == "nan" else v
+
+
+def move_player_rows(wrong, correct, match_ids=None, keys=None):
+    """Move entries saved under the wrong player to the right one (a wrong name link).
+    match_ids: move everything of `wrong` in these matches.
+    keys: move only these entries — [(tab, match_id, team, scorecard name)], tab = batting / bowling /
+    fielding. Used when one match has two different players saved under the same name (e.g. two
+    Umers in an intra-squad game): only the ticked one moves. Returns {tab: rows moved}."""
     wrong, correct = str(wrong), str(correct)
     moved = {}
-    if not ids or not wrong.strip() or not correct.strip() or wrong == correct:
+    if not wrong.strip() or not correct.strip() or wrong == correct or not (match_ids or keys):
         return moved
-    # batting also names him as bowler/fielder on older rows (same columns rename_many updates)
-    for name, cols in (("batting", ("player", "bowler", "fielder")), ("bowling", ("player",)),
-                       ("fielding", ("player",))):
+    ids = {str(m) for m in (match_ids or [])}
+    sel = {"batting": set(), "bowling": set(), "fielding": set()}
+    for tab, mid, team, sc in (keys or []):
+        sel[tab].add((str(mid), _norm(team), _norm(sc)))
+    picked_sides = {t: {(m, tm) for m, tm, _ in v} for t, v in sel.items()}   # (match, side) per tab
+    have_field = set(load("fielding")["match_id"].astype(str)) if keys else set()
+
+    for name in ("batting", "bowling", "fielding"):
         df = load(name)
         if df.empty:
             continue
-        in_match = df["match_id"].astype(str).isin(ids)
+        mid = df["match_id"].astype(str)
+        team = df["team"].map(_norm)
         n = 0
-        for col in cols:
-            if col not in df:
-                continue
-            hit = in_match & (df[col].fillna("").astype(str) == wrong)
-            if hit.any():
-                df.loc[hit, col] = correct
-                n += int(hit.sum())
+        if ids:                                   # whole matches
+            in_match = mid.isin(ids)
+            for col in ("player", "bowler", "fielder") if name == "batting" else ("player",):
+                if col in df:
+                    hit = in_match & (df[col].fillna("").astype(str) == wrong)
+                    df.loc[hit, col] = correct
+                    n += int(hit.sum())
+        else:                                     # only the ticked entries
+            sc = df["scorecard_name"].map(_norm) if "scorecard_name" in df else pd.Series("", index=df.index)
+            key = pd.Series(list(zip(mid, team, sc)), index=df.index)
+            hit = (df["player"].fillna("").astype(str) == wrong) & key.isin(sel[name])
+            df.loc[hit, "player"] = correct
+            n += int(hit.sum())
+            if name == "batting":
+                # older matches keep catches / bowler names on the other side's batting rows
+                for col, tab in (("fielder", "fielding"), ("bowler", "bowling")):
+                    if col not in df or not picked_sides[tab]:
+                        continue
+                    for m, side in picked_sides[tab]:
+                        if col == "fielder" and m in have_field:
+                            continue                  # this match's catches are in the fielding tab
+                        h2 = (mid == m) & (team != side) & (df[col].fillna("").astype(str) == wrong)
+                        df.loc[h2, col] = correct
+                        n += int(h2.sum())
         if n:
             _overwrite(name, df)
             moved[name] = n
