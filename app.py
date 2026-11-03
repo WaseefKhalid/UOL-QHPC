@@ -420,18 +420,27 @@ def reset_filters():
         st.session_state.pop(k, None)
 
 
+# Every side you picked as yours when uploading (both sides of an intra-squad game) is your team,
+# even if its name isn't in "Your team name(s)" — e.g. QHPC JUNIOR, or "Greens" and "Whites".
+SAVED_OURS = {team_key(t) for s in matches["our_team"] for t in str(s).split(" & ") if t.strip()}
+
+
+def is_ours(team, names):
+    return team_key(team) in SAVED_OURS or team_matches(team, names)
+
+
 with st.sidebar:
     ui.sidebar_brand()
     our_names = [n.strip() for n in st.session_state.our_team.split(",") if n.strip()]
     all_teams = sorted(set(bat_all["team"]) | set(bowl_all["team"]))
-    other_teams = [t for t in all_teams if not team_matches(t, our_names)]
+    other_teams = [t for t in all_teams if not is_ours(t, our_names)]
     if IS_ADMIN:
         st.session_state.our_team = st.text_input(
             "Your team name(s)", st.session_state.our_team,
             help="Only this team's players are saved. If the scorer writes it differently, "
                  "add each spelling separated by commas, e.g. UOL QHPC, UOL Qalandars")
         our_names = [n.strip() for n in st.session_state.our_team.split(",") if n.strip()]
-        other_teams = [t for t in all_teams if not team_matches(t, our_names)]
+        other_teams = [t for t in all_teams if not is_ours(t, our_names)]
         online = db.use_sheets()
         st.caption(("🟢 " if online else "🟡 ") + "Data store: " + db.backend_label())
         if not online:
@@ -822,7 +831,7 @@ def data_health():
     checks.append(("Opposition names that look alike", "check", "🛠 Manage → Opposition names",
                    pd.DataFrame({"Possibly the same team": [", ".join(g) for g in opp_groups]})))
 
-    others = [t for t in sorted(set(bat_all["team"]) | set(bowl_all["team"])) if not team_matches(t, our_names)]
+    others = [t for t in sorted(set(bat_all["team"]) | set(bowl_all["team"])) if not is_ours(t, our_names)]
     checks.append(("Other teams' player stats still saved", "fix", "🛠 Manage → Remove other teams' stats",
                    pd.DataFrame({"Team": others})))
     return checks
@@ -1557,77 +1566,88 @@ with TABS["mvp"]:
 def team_analysis(m):
     show_filter_note(batting=False)
     rec = team_record(m)
-    n_intra = int((m["outcome_label"] == INTRA).sum())
+    n_intra = rec["Intra"]
     if rec["Played"] == 0:
-        st.info("No matches against other teams in the current filters."
-                + (f" ({n_intra} intra-squad game(s) aren't counted in results.)" if n_intra else ""))
+        st.info("No matches in the current filters.")
         return
     win = f"{rec['Win %']:.0f}%" if rec["Win %"] is not None else "—"
     ui.cards([
-        ("Played", rec["Played"], f"+ {n_intra} intra-squad (not counted)" if n_intra else "vs other teams"),
+        ("Played", rec["Played"], f"incl. {n_intra} intra-squad" if n_intra else "vs other teams"),
         ("Won", rec["Won"], ""),
         ("Lost", rec["Lost"], ""),
         ("Tied · Drawn · NR", f"{rec['Tied']} · {rec['Drawn']} · {rec['No result']}", ""),
         ("Win %", win, "of games with a result"),
     ])
+    if n_intra:
+        st.caption(f"{n_intra} intra-squad game(s) count as played and are in every table below by format, ball "
+                   "and coach — but we're on both sides, so they have no winner and aren't in win %, head to "
+                   "head, toss or home/away.")
     if rec["Not set"]:
         st.caption(f"⚠️ {rec['Not set']} match(es) have no result recorded, so they're left out of win %.")
 
-    games = m[m["outcome_label"] != INTRA].sort_values("date_dt", na_position="first")
-    recent = games.tail(10)
-    st.markdown("**Recent form** — oldest to latest")
-    ui.form_strip([(r["outcome_label"], f"{r['outcome_label']} vs {r['opponent_label']}"
-                    + (f" · {r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else ""))
-                   for _, r in recent.iterrows()])
+    allg = m.sort_values("date_dt", na_position="first")            # every match, intra-squad included
+    games = allg[allg["outcome_label"] != INTRA]                      # matches against other teams
+    if games.empty:
+        st.caption("Only intra-squad games in these filters — form, head to head and toss need a match "
+                   "against another team.")
+    else:
+        recent = games.tail(10)
+        st.markdown("**Recent form** — oldest to latest")
+        ui.form_strip([(r["outcome_label"], f"{r['outcome_label']} vs {r['opponent_label']}"
+                        + (f" · {r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else ""))
+                       for _, r in recent.iterrows()])
 
-    ui.section("01", "Head to head")
-    st.caption("Your record against each team.")
-    show_table(record_table(games, "opponent_label", "Opponent"), "h2h", result_col="Last result",
-               mobile_cols=["Opponent"] + REC_MOBILE)
+        ui.section("01", "Head to head")
+        st.caption("Your record against each team.")
+        show_table(record_table(games, "opponent_label", "Opponent"), "h2h", result_col="Last result",
+                   mobile_cols=["Opponent"] + REC_MOBILE)
 
-    ui.section("02", "Toss · batting first vs chasing")
-    known_inn = games[games["innings_label"] != NOT_SET]
-    bf, ch = (team_record(known_inn[known_inn["innings_label"] == k]) for k in INNINGS)
-    tw = team_record(games[games["toss_label"] == "Won"])
-    fmt_pct = lambda r: f"{r['Win %']:.0f}%" if r["Win %"] is not None else "—"
-    ui.cards([
-        ("Win % batting first", fmt_pct(bf), f"{bf['Won']} won of {bf['Played']}"),
-        ("Win % chasing", fmt_pct(ch), f"{ch['Won']} won of {ch['Played']}"),
-        ("Win % after winning toss", fmt_pct(tw), f"{tw['Won']} won of {tw['Played']}"),
-        ("Tosses won", f"{int((games['toss_label'] == 'Won').sum())} of "
-                       f"{int(games['toss_label'].isin(TOSSES).sum())}", ""),
-    ])
-    c1, c2 = st.columns(2, gap="medium")
-    with c1:
-        show_table(record_table(games, "innings_label", "Our innings").drop(columns=["Last result"]), "rec_innings_label",
-                   mobile_cols=["Our innings"] + REC_MOBILE)
-    with c2:
-        show_table(record_table(games, "toss_label", "Toss").drop(columns=["Last result"]), "rec_toss_label",
-                   mobile_cols=["Toss"] + REC_MOBILE)
-    show_table(record_table(games, "toss_innings", "Toss and decision").drop(columns=["Last result"]), "rec_toss_innings",
-               mobile_cols=["Toss and decision"] + REC_MOBILE)
-    unknown = int(((games["toss_label"] == NOT_SET) | (games["innings_label"] == NOT_SET)).sum())
-    if unknown:
-        st.caption(f"{unknown} match(es) have no toss or innings recorded — set them in the 📋 Matches tab.")
+        ui.section("02", "Toss · batting first vs chasing")
+        known_inn = games[games["innings_label"] != NOT_SET]
+        bf, ch = (team_record(known_inn[known_inn["innings_label"] == k]) for k in INNINGS)
+        tw = team_record(games[games["toss_label"] == "Won"])
+        fmt_pct = lambda r: f"{r['Win %']:.0f}%" if r["Win %"] is not None else "—"
+        ui.cards([
+            ("Win % batting first", fmt_pct(bf), f"{bf['Won']} won of {bf['Played']}"),
+            ("Win % chasing", fmt_pct(ch), f"{ch['Won']} won of {ch['Played']}"),
+            ("Win % after winning toss", fmt_pct(tw), f"{tw['Won']} won of {tw['Played']}"),
+            ("Tosses won", f"{int((games['toss_label'] == 'Won').sum())} of "
+                           f"{int(games['toss_label'].isin(TOSSES).sum())}", ""),
+        ])
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            show_table(record_table(games, "innings_label", "Our innings").drop(columns=["Last result"]), "rec_innings_label",
+                       mobile_cols=["Our innings"] + REC_MOBILE)
+        with c2:
+            show_table(record_table(games, "toss_label", "Toss").drop(columns=["Last result"]), "rec_toss_label",
+                       mobile_cols=["Toss"] + REC_MOBILE)
+        show_table(record_table(games, "toss_innings", "Toss and decision").drop(columns=["Last result"]), "rec_toss_innings",
+                   mobile_cols=["Toss and decision"] + REC_MOBILE)
+        unknown = int(((games["toss_label"] == NOT_SET) | (games["innings_label"] == NOT_SET)).sum())
+        if unknown:
+            st.caption(f"{unknown} match(es) have no toss or innings recorded — set them in the 📋 Matches tab.")
 
     ui.section("03", "Home and away · white and red ball")
     c1, c2 = st.columns(2, gap="medium")
     with c1:
-        show_table(record_table(games, "venue_label", "Venue").drop(columns=["Last result"]), "rec_venue_label",
-                   mobile_cols=["Venue"] + REC_MOBILE)
+        if not games.empty:
+            show_table(record_table(games, "venue_label", "Venue").drop(columns=["Last result"]), "rec_venue_label",
+                       mobile_cols=["Venue"] + REC_MOBILE)
     with c2:
-        show_table(record_table(games, "ball_label", "Ball").drop(columns=["Last result"]), "rec_ball_label",
+        show_table(record_table(allg, "ball_label", "Ball").drop(columns=["Last result"]), "rec_ball_label",
                    mobile_cols=["Ball"] + REC_MOBILE)
 
     ui.section("04", "By match format")
-    show_table(record_table(games, "format_label", "Format").drop(columns=["Last result"]), "rec_format_label",
+    show_table(record_table(allg, "format_label", "Format").drop(columns=["Last result"]), "rec_format_label",
                mobile_cols=["Format"] + REC_MOBILE)
 
     ui.section("05", "All results")
-    allr = games.sort_values("date_dt", ascending=False, na_position="last")
+    allr = allg.sort_values("date_dt", ascending=False, na_position="last")
+    intra = allr["outcome_label"] == INTRA
     show_table(pd.DataFrame({
-        "Date": fmt_date(allr["date_dt"]), "Opponent": allr["opponent_label"], "Venue": allr["venue_label"],
-        "Toss": allr["toss_label"], "Innings": allr["innings_label"], "Format": allr["format_label"],
+        "Date": fmt_date(allr["date_dt"]), "Opponent": allr["opponent_label"].where(~intra, INTRA),
+        "Venue": allr["venue_label"].where(~intra, "—"), "Toss": allr["toss_label"].where(~intra, "—"),
+        "Innings": allr["innings_label"].where(~intra, "—"), "Format": allr["format_label"],
         "Ball": allr["ball_label"], "Us": allr["our_score"], "Them": allr["opp_score"],
         "Result": allr["outcome_label"], "Margin": allr["result"]}), "all_results", result_col="Result",
         mobile_cols=["Date", "Opponent", "Result"])
@@ -1722,7 +1742,7 @@ if IS_ADMIN:
 @st.fragment
 def coach_analysis(m):
     show_filter_note(batting=False)
-    games = m[m["outcome_label"] != INTRA]
+    games = m                                         # intra-squad games included, like every other match
     with_coach = games[games["coach_label"] != NOT_SET]
     missing = int((games["coach_label"] == NOT_SET).sum())
     if missing:
@@ -1745,8 +1765,9 @@ def coach_analysis(m):
         ("Most matches", int(table["P"].max()), table.sort_values("P", ascending=False).iloc[0]["Coach"]),
     ])
     ui.section("01", "Win / loss by coach")
-    st.caption("Intra-squad games aren't counted. Win % = won ÷ matches with a result. A match two coaches "
-               "supervised together counts for both of them — **Shared** shows how many of their matches that was.")
+    st.caption("Win % = won ÷ matches with a result. Intra-squad games count as played (**Intra** column) but "
+               "have no winner, so they're not in win %. A match two coaches supervised together counts for both "
+               "of them — **Shared** shows how many of their matches that was.")
     show_table(table, "coach_rec", result_col="Last result", mobile_cols=["Coach"] + REC_MOBILE)
 
     ui.section("02", "Coach by match format")
@@ -1754,8 +1775,10 @@ def coach_analysis(m):
     for (coach, fmt), g in each.groupby(["coach_one", "format_label"]):
         r = team_record(g)
         rows.append({"Coach": coach, "Format": fmt, "P": r["Played"], "W": r["Won"], "L": r["Lost"],
-                     "D/T/NR": r["Drawn"] + r["Tied"] + r["No result"], "Win %": r["Win %"]})
-    by_fmt = pd.DataFrame(rows, columns=["Coach", "Format", "P", "W", "L", "D/T/NR", "Win %"])
+                     "D/T/NR": r["Drawn"] + r["Tied"] + r["No result"], "Intra": r["Intra"], "Win %": r["Win %"]})
+    by_fmt = pd.DataFrame(rows, columns=["Coach", "Format", "P", "W", "L", "D/T/NR", "Intra", "Win %"])
+    if not by_fmt["Intra"].any():
+        by_fmt = by_fmt.drop(columns=["Intra"])
     by_fmt["Win %"] = pd.to_numeric(by_fmt["Win %"], errors="coerce")
     show_table(by_fmt.sort_values(["Coach", "P"], ascending=[True, False]), "coach_fmt",
                mobile_cols=["Coach", "Format", "P", "Win %"])
@@ -1773,23 +1796,30 @@ def coach_analysis(m):
     g = each[each["coach_one"] == pick].sort_values("date_dt", na_position="first")
     r = team_record(g)
     n_sh = int((g["n_coaches"] > 1).sum())
-    ui.cards([("Played", r["Played"], f"{n_sh} shared" if n_sh else "none shared"), ("Won", r["Won"], ""),
+    ui.cards([("Played", r["Played"], " · ".join(x for x in [f"{n_sh} shared" if n_sh else "",
+                                                             f"{r['Intra']} intra-squad" if r["Intra"] else ""] if x)),
+              ("Won", r["Won"], ""),
               ("Lost", r["Lost"], ""),
               ("Win %", f"{r['Win %']:.0f}%" if r["Win %"] is not None else "—", "of games with a result")],
              small=True)
-    st.markdown("**Recent form** — oldest to latest")
-    ui.form_strip([(x["outcome_label"], f"{x['outcome_label']} vs {x['opponent_label']}") for _, x in g.tail(10).iterrows()])
+    g_vs = g[g["outcome_label"] != INTRA]          # results need an opponent
+    if not g_vs.empty:
+        st.markdown("**Recent form** — oldest to latest")
+        ui.form_strip([(x["outcome_label"], f"{x['outcome_label']} vs {x['opponent_label']}")
+                       for _, x in g_vs.tail(10).iterrows()])
     c1, c2 = st.columns(2, gap="medium")
     with c1:
-        show_table(record_table(g, "venue_label", "Venue").drop(columns=["Last result"]), "coach_venue",
-                   mobile_cols=["Venue"] + REC_MOBILE)
+        if not g_vs.empty:
+            show_table(record_table(g_vs, "venue_label", "Venue").drop(columns=["Last result"]), "coach_venue",
+                       mobile_cols=["Venue"] + REC_MOBILE)
     with c2:
         show_table(record_table(g, "ball_label", "Ball").drop(columns=["Last result"]), "coach_ball",
                    mobile_cols=["Ball"] + REC_MOBILE)
     gg = g.sort_values("date_dt", ascending=False, na_position="last")
     games_tbl = pd.DataFrame({
-        "Date": fmt_date(gg["date_dt"]), "Opponent": gg["opponent_label"], "Format": gg["format_label"],
-        "Venue": gg["venue_label"], "Result": gg["outcome_label"], "Margin": gg["result"],
+        "Date": fmt_date(gg["date_dt"]),
+        "Opponent": gg["opponent_label"].where(gg["outcome_label"] != INTRA, INTRA), "Format": gg["format_label"],
+        "Venue": gg["venue_label"].where(gg["outcome_label"] != INTRA, "—"), "Result": gg["outcome_label"], "Margin": gg["result"],
         "With": [", ".join(x for x in split_coaches(c) if x != pick) or "—" for c in gg["coach_label"]]})
     if not n_sh:
         games_tbl = games_tbl.drop(columns=["With"])
