@@ -15,6 +15,8 @@ TOSSES = ("Won", "Lost")
 INNINGS = ("Batted first", "Chased")
 OUTCOMES = ("Won", "Lost", "Tied", "Drawn", "No result")
 INTRA = "Intra-squad"
+VS_OTHERS = "Vs other teams"
+MATCH_KINDS = (VS_OTHERS, INTRA)     # the "Match type" filter
 FORMAT_CHOICES = ["Inter Academy Senior Team Match", "Inter Academy Junior Team Match",
                   "Intra Academy Senior Match", "Intra Academy Junior Match",
                   "Group C Junior Inter Academy Match", "Group C Junior Intra Academy Match",
@@ -358,6 +360,7 @@ def match_table(m_df):
     m["our_side"], m["opponent_label"] = sides, opps
     m["our_score"], m["opp_score"], m["outcome_label"] = ours, theirs, outcomes
     m["toss_label"], m["innings_label"] = tosses, inns
+    m["kind_label"] = np.where(pd.Series(outcomes, index=m.index) == INTRA, INTRA, VS_OTHERS)
     m["toss_innings"] = [
         {("Won", "Batted first"): "Won toss · chose to bat", ("Won", "Chased"): "Won toss · chose to field",
          ("Lost", "Batted first"): "Lost toss · put in to bat", ("Lost", "Chased"): "Lost toss · sent to field",
@@ -397,6 +400,7 @@ def enrich(m_df, bat, bowl, field=None):
         df["ball_label"] = _lookup(df["match_id"], info["ball_label"]).fillna(NOT_SET)
         df["venue_label"] = _lookup(df["match_id"], info["venue_label"]).fillna(NOT_SET)
         df["innings_label"] = _lookup(df["match_id"], info["innings_label"]).fillna(NOT_SET)
+        df["kind_label"] = _lookup(df["match_id"], info["kind_label"]).fillna(VS_OTHERS)
         ta = _lookup(df["match_id"], info["team_a"]).fillna("")
         tb = _lookup(df["match_id"], info["team_b"]).fillna("")
         df["opponent"] = np.where(df["team"] == ta, tb, np.where(df["team"] == tb, ta, ""))
@@ -431,8 +435,10 @@ def enrich(m_df, bat, bowl, field=None):
 
 
 def filter_rows(df, date_range=None, include_undated=True, formats=None, positions=None, bowl_types=None,
-                balls=None, venues=None, innings=None):
+                balls=None, venues=None, innings=None, kinds=None):
     out = df
+    if kinds:
+        out = out[out["kind_label"].isin(kinds)]
     if date_range:
         lo, hi = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
         ok = out["date_dt"].between(lo, hi)
