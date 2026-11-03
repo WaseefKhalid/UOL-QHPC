@@ -456,29 +456,32 @@ def filter_rows(df, date_range=None, include_undated=True, formats=None, positio
 
 # ---------------- team results ----------------
 def team_record(m):
-    """Played / won / lost ... for your team. Intra-squad games are left out.
-    Win % = won ÷ matches with a result (no-results don't count either way)."""
-    m = m[m["outcome_label"] != INTRA]
+    """Played / won / lost ... for your team. Intra-squad games count as played (column Intra) like
+    any other match, but you're on both sides, so they have no winner and stay out of win %.
+    Win % = won ÷ matches with a result (no-results and intra-squad games don't count either way)."""
     oc = m["outcome_label"]
     rec = {k: int((oc == k).sum()) for k in OUTCOMES}
+    rec["Intra"] = int((oc == INTRA).sum())
     rec["Played"] = len(m)
     rec["Not set"] = int((oc == NOT_SET).sum())
-    decided = rec["Played"] - rec["No result"] - rec["Not set"]
+    decided = rec["Played"] - rec["No result"] - rec["Not set"] - rec["Intra"]
     rec["Win %"] = round(rec["Won"] / decided * 100, 1) if decided else None
     return rec
 
 
 def record_table(m, by, label):
-    """One row per value of `by` (opponent, venue, ball, format) with P / W / L / T / D / NR / Win %."""
-    m = m[m["outcome_label"] != INTRA]
+    """One row per value of `by` (opponent, venue, ball, format, coach) with P / W / L / T / D / NR / Win %.
+    Intra-squad games count in P and get their own Intra column (shown only when there are any)."""
     rows = []
     for key, g in m.groupby(by):
         r = team_record(g)
         last = g.sort_values("date_dt").iloc[-1]
         rows.append({label: key or "—", "P": r["Played"], "W": r["Won"], "L": r["Lost"], "T": r["Tied"],
-                     "D": r["Drawn"], "NR": r["No result"], "Win %": r["Win %"],
+                     "D": r["Drawn"], "NR": r["No result"], "Intra": r["Intra"], "Win %": r["Win %"],
                      "Last result": last["outcome_label"]})
-    out = pd.DataFrame(rows, columns=[label, "P", "W", "L", "T", "D", "NR", "Win %", "Last result"])
+    out = pd.DataFrame(rows, columns=[label, "P", "W", "L", "T", "D", "NR", "Intra", "Win %", "Last result"])
+    if not out["Intra"].any():
+        out = out.drop(columns=["Intra"])
     out["Win %"] = pd.to_numeric(out["Win %"], errors="coerce")
     return out.sort_values(["P", "Win %"], ascending=False, ignore_index=True)
 
