@@ -2016,8 +2016,11 @@ def lists_section(matches):
 def fix_link_section(bat_all, bowl_all, field_all):
     st.subheader("Fix a wrong player link")
     st.caption("Saved a match under the wrong player? For example “Daniyal” was linked to Daniyal Iftikhar but it "
-               "was really Daniyal Nadeem. Pick the name it was saved under, tick the wrong match(es), choose who it "
-               "really was, and apply. Only the ticked matches move — that player's other matches stay as they are.")
+               "was really Daniyal Nadeem. Pick the name it was saved under, tick the wrong row(s), choose who it "
+               "really was, and apply. Only the ticked rows move — that player's other matches stay as they are. "
+               "If two different players were saved under one name in the same match (e.g. two Umers in an "
+               "intra-squad game), that match shows one row per player, with batting position, so you can move "
+               "just one of them.")
     flash("fix_done")
     everyone = sorted(set(bat_all["player"]) | set(bowl_all["player"]) | set(field_all["player"]))
     if not everyone:
@@ -2033,27 +2036,50 @@ def fix_link_section(bat_all, bowl_all, field_all):
         d = df[df["player"] == wrong].copy()
         if "scorecard_name" not in d:
             d["scorecard_name"] = ""
+        d["sc"] = d["scorecard_name"].map(_text).replace("nan", "")
+        d["side"] = d["team"].map(lambda t: " ".join(str(t).split()))
         return d.assign(kind=kind)
     rows = pd.concat([mine(bat_all, "bat"), mine(bowl_all, "bowl"), mine(field_all, "field")], ignore_index=True)
     if rows.empty:
         st.caption("No saved entries for this player.")
         return
+    # One row per player-in-a-match: match + side + the name the scorecard used. Normally that's one row
+    # per match; two different players saved under one name in the same match become two rows.
+    # Catches join the batting/bowling row of the same side (by scorecard name when there are two).
+    rows["grp"] = [(str(m), t, n) for m, t, n in zip(rows["match_id"], rows["side"], rows["sc"])]
+    main = rows[rows["kind"] != "field"]
+    for i in rows.index[rows["kind"] == "field"]:
+        m, t, n = rows.at[i, "grp"]
+        cand = sorted({g for g in main["grp"] if g[0] == m and g[1] == t})
+        same = [g for g in cand if g[2] == n]
+        rows.at[i, "grp"] = same[0] if same else (cand[0] if len(cand) == 1 else rows.at[i, "grp"])
+    tab_of = {"bat": "batting", "bowl": "bowling", "field": "fielding"}
     out = []
-    for mid, g in rows.groupby("match_id", sort=False):
+    for grp, g in rows.groupby("grp", sort=False):
         b, w, f = g[g["kind"] == "bat"], g[g["kind"] == "bowl"], g[g["kind"] == "field"]
-        sc = sorted({_text(x) for x in g["scorecard_name"]} - {"", "nan"})
+        sc = sorted(set(g["sc"]) - {""})
         bat_txt = ", ".join(f"{_int(r.runs)}{'*' if _text(r.how_out).lower() == 'not out' else ''} ({_int(r.balls)})"
+                            + (f" · No. {int(r.position)}" if pd.notna(r.position) else "")
                             for r in b.itertuples())
         bowl_txt = ", ".join(f"{_int(r.wickets)}/{_int(r.runs)}" for r in w.itertuples())
         out.append({"Wrong?": False, "date_dt": g["date_dt"].iloc[0], "Opponent": _text(g["opponent"].iloc[0]) or "—",
-                    "Scorecard said": ", ".join(sc) or "—", "Batting": bat_txt or "—", "Bowling": bowl_txt or "—",
-                    "Catches": len(f), "match_id": str(mid), "names": sc})
-    table = pd.DataFrame(out).sort_values("date_dt", ascending=False, na_position="last").reset_index(drop=True)
+                    "Side": grp[1] or "—", "Scorecard said": ", ".join(sc) or "—", "Batting": bat_txt or "—",
+                    "Bowling": bowl_txt or "—", "Catches": len(f), "match_id": grp[0], "names": sc,
+                    "keys": [(tab_of[k], m, t, n) for k, m, t, n in zip(g["kind"], g["match_id"], g["side"], g["sc"])]})
+    table = pd.DataFrame(out).sort_values("date_dt", ascending=False, na_position="last", kind="stable")
+    table = table.reset_index(drop=True)
     table.insert(1, "Date", fmt_date(pd.to_datetime(table["date_dt"])))
-    st.markdown(f"**2 · Tick the match(es) that were not really {wrong}** · {len(table)} saved match(es)")
-    ed = st.data_editor(table[["Wrong?", "Date", "Opponent", "Scorecard said", "Batting", "Bowling", "Catches"]],
-                        hide_index=True, width="stretch", key=f"fix_ed_{h}",
-                        disabled=["Date", "Opponent", "Scorecard said", "Batting", "Bowling", "Catches"],
+    split = table["match_id"].duplicated(keep=False)
+    n_matches = table["match_id"].nunique()
+    st.markdown(f"**2 · Tick what was not really {wrong}** · {n_matches} saved match(es)")
+    if split.any():
+        st.caption(f"⚠️ {int(table.loc[split, 'match_id'].nunique())} match(es) have two different entries saved "
+                   f"under {wrong} — shown as separate rows. Use the batting position and scorecard name to tell "
+                   "them apart, and tick only the one that wasn't him.")
+    show_cols = ["Wrong?", "Date", "Opponent"] + (["Side"] if split.any() else []) + \
+                ["Scorecard said", "Batting", "Bowling", "Catches"]
+    ed = st.data_editor(table[show_cols], hide_index=True, width="stretch", key=f"fix_ed_{h}",
+                        disabled=[c for c in show_cols if c != "Wrong?"],
                         column_config={"Wrong?": st.column_config.CheckboxColumn("Wrong?", width="small"),
                                        "Catches": st.column_config.NumberColumn("Catches", width="small")})
     picked = table[ed["Wrong?"].fillna(False).astype(bool).values]
@@ -2061,6 +2087,9 @@ def fix_link_section(bat_all, bowl_all, field_all):
         st.caption("Nothing ticked yet.")
         return
     sc_names = sorted({n for names in picked["names"] for n in names})
+    # a scorecard name also used for rows you didn't tick is ambiguous — don't remember it by default
+    unticked = {n for names in table.loc[~table.index.isin(picked.index), "names"] for n in names}
+    ambiguous = bool(set(sc_names) & unticked)
     squad = db.squad_names()
     opts = [p for p in dict.fromkeys(squad + everyone) if p != wrong]
     st.markdown("**3 · Who it really was**")
@@ -2072,33 +2101,36 @@ def fix_link_section(bat_all, bowl_all, field_all):
     remember = False
     if sc_names:
         remember = c2.checkbox(f"From now on, “{' / '.join(sc_names)}” on a scorecard means {correct or '…'}",
-                               value=True, key=f"fix_rem_{h}", disabled=not correct,
+                               value=not ambiguous, disabled=not correct,
+                               key=f"fix_rem_{h}_{short_hash('|'.join(sc_names))}_{int(ambiguous)}",
                                help="Updates the remembered spelling, so the next upload suggests the right player. "
                                     "If two squad players fit that name you are still asked each time — this just "
                                     "changes which one is pre-selected.")
     if not correct:
         return
-    st.caption(f"{len(picked)} match(es) will move from **{wrong}** to **{correct}**: "
-               + "; ".join(f"{d} vs {o}" for d, o in zip(picked["Date"], picked["Opponent"])))
+    st.caption(f"{len(picked)} row(s) will move from **{wrong}** to **{correct}**: "
+               + "; ".join(f"{d} vs {o}" + (f" ({bt})" if bt != "—" else "")
+                           for d, o, bt in zip(picked["Date"], picked["Opponent"], picked["Batting"])))
     if st.button(f"✅  Move to {correct}", type="primary", key=f"fix_go_{h}"):
         import gspread
         try:
             with st.spinner("Updating the saved matches…"):
                 if kind == "new":
                     db.add_to_squad([correct])
-                moved = db.move_player_rows(wrong, correct, picked["match_id"].tolist())
+                moved = db.move_player_rows(wrong, correct, keys=[k for ks in picked["keys"] for k in ks])
                 if remember:
                     db.save_spellings({n: (correct, True) for n in sc_names})
         except gspread.exceptions.APIError:
             st.error("Google Sheets is busy (too many changes in a minute). Wait a minute and press the button "
                      "again — nothing is lost.")
             return
-        msg = f"Moved {len(picked)} match(es) from {wrong} to {correct}."
+        msg = f"Moved {len(picked)} row(s) from {wrong} to {correct}."
         if moved.get("bowling") and correct not in db.bowling_types():
             msg += f" {correct} has no bowling type yet — set pace or spin under “Bowling types” below."
         st.session_state["fix_done"] = msg
-        for k in ("fix_wrong", f"fix_ed_{h}", f"fix_to_{h}", f"fix_to_{h}_new", f"fix_rem_{h}"):
+        for k in [k for k in st.session_state if str(k).startswith((f"fix_ed_{h}", f"fix_to_{h}", f"fix_rem_{h}"))]:
             st.session_state.pop(k, None)
+        st.session_state.pop("fix_wrong", None)
         st.rerun(scope="app")
 
 
