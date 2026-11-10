@@ -850,7 +850,7 @@ HEALTH = data_health() if IS_ADMIN else []
 n_issues = sum(1 for c in HEALTH if not c[3].empty)
 
 TAB_LABELS = {"top": "🏆  Top performers", "mvp": "🏅  MVP", "team": "📈  Team analysis",
-              "board": "📊  Leaderboards", "search": "🔎  Player search"}
+              "board": "📊  Leaderboards", "search": "🔎  Player search", "summary": "🏏  Match summary"}
 if IS_ADMIN:
     TAB_LABELS.update({"add": "➕  Add matches", "matches": "📋  Matches", "coach": "🧑‍🏫  Coaches",
                        "manage": "🛠  Manage",
@@ -1664,6 +1664,156 @@ def team_analysis(m):
 
 with TABS["team"]:
     team_analysis(m_view)
+
+
+# ---------------- Match summary (public) ----------------
+def _score_parts(score):
+    """'200-10 in 34.5 overs' -> ('200-10', '34.5 overs'); two innings joined with ' & '."""
+    runs, overs = [], []
+    for part in str(score or "").split(" & "):
+        mm = re.match(r"^\s*(.+?)\s+in\s+([\d.]+)\s+overs", part)
+        if mm:
+            runs.append(mm.group(1)); overs.append(mm.group(2))
+        elif part.strip():
+            runs.append(part.strip())
+    return " & ".join(runs), (" & ".join(overs) + " overs") if overs else ""
+
+
+def _short_sides(a, b):
+    """'UOL QHPC REDS' / 'UOL QHPC GREENS' -> 'REDS' / 'GREENS' (drop the words both names share)."""
+    wa, wb = str(a).split(), str(b).split()
+    i = 0
+    while i < min(len(wa), len(wb)) - 1 and wa[i].lower() == wb[i].lower():
+        i += 1
+    return " ".join(wa[i:]) or a, " ".join(wb[i:]) or b
+
+
+def match_summary_data(r):
+    """Everything for one match's summary: header, both scores, result, star performer and the
+    top batters / bowlers (our players — both sides in an intra-squad game)."""
+    def clean(v):
+        v = "" if v is None or (isinstance(v, float) and pd.isna(v)) else " ".join(str(v).split())
+        return "" if v.lower() in ("nan", "none") else v
+    r = {k: (clean(v) if isinstance(v, (str, float)) and k != "date_dt" else v) for k, v in r.items()}
+    mid, side = r["match_id"], r["our_side"]
+    intra = side == "AB"
+    names = {"A": r["team_a"] or "Team A", "B": r["team_b"] or "Team B"}
+    if side in ("A", "B"):
+        other = "B" if side == "A" else "A"
+        names[other] = r["opponent_label"] or names[other]
+    b = bat_all[bat_all["match_id"] == mid]
+    w = bowl_all[bowl_all["match_id"] == mid]
+    f = field_all[field_all["match_id"] == mid]
+    if not intra:                                   # older data may still hold the other side's rows
+        b, w, f = (x.loc[x["team"].map(lambda t: is_ours(t, our_names)).astype(bool)] for x in (b, w, f))
+    tags = dict(zip([r["team_a"], r["team_b"]], _short_sides(r["team_a"], r["team_b"]))) if intra else {}
+
+    teams = []
+    for k in ("A", "B"):
+        runs, ov = _score_parts(r[f"score_{k.lower()}"])
+        teams.append({"name": names[k], "score": runs, "overs": ov, "ours": intra or k == side})
+    if side in ("A", "B"):
+        title = f"{names[side]} vs {names['B' if side == 'A' else 'A']}"
+    else:
+        title = f"{names['A']} vs {names['B']}"
+    result = str(r["result"] or "").strip()
+    if not result and r["outcome_label"] in ("Won", "Lost"):
+        result = f"{names[side]} {'won' if r['outcome_label'] == 'Won' else 'lost'}"
+    bits = [r["format_label"] if r["format_label"] != NO_FORMAT else "",
+            r["ball_label"] if r["ball_label"] != NOT_SET else "",
+            f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "",
+            r["venue_label"] if r["venue_label"] != NOT_SET and not intra else ""]
+    subtitle = " · ".join(x for x in bits if x)
+
+    def tag(t):
+        return f"{tags.get(t, '')} · " if tags.get(t) else ""
+    bat_rows, bowl_rows = [], []
+    for x in b.sort_values(["runs", "balls"], ascending=[False, True]).itertuples():
+        extra = [f"{int(x.fours)}×4" if x.fours else "", f"{int(x.sixes)}×6" if x.sixes else "",
+                 f"SR {100 * x.runs / x.balls:.1f}" if x.balls else ""]
+        bat_rows.append((x.player, f"{int(x.runs)}{'*' if x.how_out == 'not out' else ''}", f"{int(x.balls)} balls",
+                         tag(x.team) + (" · ".join(e for e in extra if e) or str(x.how_out))))
+    for x in w.sort_values(["wickets", "runs"], ascending=[False, True]).itertuples():
+        extra = [f"Econ {x.econ:.2f}" if pd.notna(x.econ) and x.overs else "",
+                 f"{int(x.maidens)} maiden{'s' if x.maidens > 1 else ''}" if x.maidens else ""]
+        bowl_rows.append((x.player, f"{int(x.wickets)}/{int(x.runs)}", f"{x.overs:g} ov",
+                          tag(x.team) + " · ".join(e for e in extra if e)))
+    star = None
+    mp = match_points(b, w, f)
+    if not mp.empty:
+        best = players_of_match(mp).iloc[0]
+        star = {"label": "Player of the match" if intra else "Star performer", "name": best["player"],
+                "line": str(best["performance"]).replace(" & ", " · ").replace(" ct", " catch"),
+                "pts": f"{int(round(best['total']))} MVP pts"}
+    toss = r.get("toss") or ""
+    return {"title": title, "subtitle": subtitle, "teams": teams, "result": result, "star": star,
+            "batters": bat_rows[:3], "bowlers": bowl_rows[:3],
+            "scope": f"Toss: {toss}" if toss else "Performance Analysis Department",
+            "footer_right": ui.SITE}, b, w
+
+
+@st.cache_data(show_spinner=False)
+def match_summary_png_cached(payload):
+    import json
+    return ui.match_summary_png(json.loads(payload)["s"])
+
+
+@st.fragment
+def match_summary(m):
+    show_filter_note(batting=False)
+    games = m.sort_values("date_dt", ascending=False, na_position="last")
+    if games.empty:
+        st.info("No matches in the current filters.")
+        return
+    labels = {}
+    for _, r in games.iterrows():
+        d = f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "No date"
+        opp = INTRA if r["our_side"] == "AB" else (r["opponent_label"] or "—")
+        res = "" if r["outcome_label"] in (NOT_SET, INTRA) else f" · {r['outcome_label']}"
+        labels[r["match_id"]] = f"{d} · vs {opp}{res}" if r["our_side"] != "AB" else f"{d} · {INTRA}: {r['team_a']} vs {r['team_b']}"
+    mid = st.selectbox("Match", list(labels), format_func=lambda k: labels.get(k, k), key="ms_pick",
+                       help="Newest first. The list follows the filters in the sidebar.")
+    r = games[games["match_id"] == mid].iloc[0]
+    data, b, w = match_summary_data(r)
+    import json
+    png = match_summary_png_cached(json.dumps({"v": ui.GRAPHICS_VERSION, "s": data}))
+    c1, c2 = st.columns([5, 6], gap="large")
+    with c1:
+        st.image(png, width="stretch")
+    with c2:
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", data["title"]).strip("-")
+        day = f"{r['date_dt']:%Y-%m-%d}" if pd.notna(r["date_dt"]) else "undated"
+        st.download_button("⬇️  Download match summary (PNG)", png, file_name=f"UOL-QHPC_Match-Summary_{day}_{slug}.png",
+                           mime="image/png", key="ms_dl", width="stretch", type="primary")
+        st.caption("A 1080 × 1350 image — the right size for Instagram, Facebook and WhatsApp.")
+        if r["our_side"] != "AB":
+            st.caption("Only our players' scorecards are saved, so the star performer and top lists are from "
+                       "our team.")
+        st.markdown("**Batting**")
+        if b.empty:
+            st.caption("No batting saved for this match.")
+        else:
+            bt = b.sort_values(["team", "pos"]) if "pos" in b else b
+            show_table(pd.DataFrame({
+                **({"Side": bt["team"]} if r["our_side"] == "AB" else {}),
+                "Player": bt["player"], "How out": bt["how_out"], "R": bt["runs"].astype(int),
+                "B": bt["balls"].astype(int), "4s": bt["fours"].astype(int), "6s": bt["sixes"].astype(int),
+                "SR": (100 * bt["runs"] / bt["balls"].where(bt["balls"] > 0)).round(1)}),
+                "ms_bat", mobile_cols=["Player", "R", "B"])
+        st.markdown("**Bowling**")
+        if w.empty:
+            st.caption("No bowling saved for this match.")
+        else:
+            wt = w.sort_values(["team", "wickets"], ascending=[True, False])
+            show_table(pd.DataFrame({
+                **({"Side": wt["team"]} if r["our_side"] == "AB" else {}),
+                "Player": wt["player"], "O": wt["overs"], "M": wt["maidens"].astype(int),
+                "R": wt["runs"].astype(int), "W": wt["wickets"].astype(int), "Econ": wt["econ"].round(2)}),
+                "ms_bowl", mobile_cols=["Player", "O", "R", "W"])
+
+
+with TABS["summary"]:
+    match_summary(m_view)
 
 with TABS["board"]:
     leaderboards(bat_f, field_f, bowl_f)
