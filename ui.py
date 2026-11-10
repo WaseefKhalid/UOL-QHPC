@@ -14,7 +14,6 @@ APP = "UOL QHPC Cricket Stats"
 STATS_FROM = "28 October 2026"   # shown at the top of every page
 GRAPHICS_VERSION = "4"   # bump when the PNG layouts change, so no old cached image is served
 LOGO = os.path.join(os.path.dirname(__file__), "assets", "logo.png")  # optional: drop your logo here
-SITE = "uol-qhpc-cricket-db.streamlit.app"   # shown on the match-summary graphic; change if the link changes
 
 CSS = f"""
 <style>
