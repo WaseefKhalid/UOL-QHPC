@@ -601,7 +601,7 @@ def match_summary_png(s):
     """Social-media match summary, 1080×1350. s: dict(title, subtitle, teams=[dict(name, score, overs, ours)],
     result, star=dict(label, name, line, pts) or None, batters/bowlers=[(name, value, sub, detail)],
     scope, footer_right)."""
-    W, H, P, band, foot = 1080, 1350, 64, 262, 112
+    W, H, P, foot = 1080, 1350, 64, 112
     from PIL import Image, ImageDraw
     pal = {k: _hex(v) for k, v in (("deep", DEEP), ("mid", MID), ("bright", BRIGHT), ("tint", TINT),
                                    ("pale", PALE), ("ink", INK), ("muted", MUTED))}
@@ -609,24 +609,32 @@ def match_summary_png(s):
     img = Image.new("RGB", (W, H), pal["white"])
     d = ImageDraw.Draw(img)
 
-    # masthead
-    d.rectangle([0, 0, W, band], fill=pal["deep"])
-    d.rectangle([0, 0, W, 14], fill=pal["bright"])
-    logo_w = 0
+    # masthead — the title shrinks a little for long names, then wraps onto two lines
+    logo = None
     if os.path.exists(LOGO):
         try:
             logo = Image.open(LOGO).convert("RGBA")
             logo.thumbnail((120, 120))
-            img.paste(logo, (W - P - logo.width, 50), logo)
-            logo_w = logo.width + 24
         except Exception:
-            pass
+            logo = None
+    tw = W - 2 * P - (logo.width + 24 if logo else 0)
+    tf = _fit(d, s["title"], "serif", 66, tw, 52)
+    lines = [s["title"]] if d.textlength(s["title"], font=tf) <= tw else _wrap(d, s["title"], _font("serif", 54), tw, 2)
+    if len(lines) > 1:
+        tf = _font("serif", 54)
+    lh = tf.size * 1.12 if hasattr(tf, "size") else 60
+    sub_y = 118 + lh * len(lines) + 14
+    band = int(sub_y + 58)
+    d.rectangle([0, 0, W, band], fill=pal["deep"])
+    d.rectangle([0, 0, W, 14], fill=pal["bright"])
+    if logo:
+        img.paste(logo, (W - P - logo.width, 50), logo)
     _spaced(d, (P, 46), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), pal["mint"], 3.2)
     _spaced(d, (P, 84), "MATCH SUMMARY", _font("bold", 24), pal["soft"], 4)
-    tf = _fit(d, s["title"], "serif", 66, W - 2 * P - logo_w, 36)
-    d.text((P, 118), _ellipsize(d, s["title"], tf, W - 2 * P - logo_w), font=tf, fill=pal["white"])
+    for i, ln in enumerate(lines):
+        d.text((P, 118 + lh * i), ln, font=tf, fill=pal["white"])
     sf = _fit(d, s["subtitle"], "regular", 28, W - 2 * P, 20)
-    d.text((P, 204), _ellipsize(d, s["subtitle"], sf, W - 2 * P), font=sf, fill=pal["soft"])
+    d.text((P, sub_y), _ellipsize(d, s["subtitle"], sf, W - 2 * P), font=sf, fill=pal["soft"])
 
     # scoreboard
     y = band + 30
