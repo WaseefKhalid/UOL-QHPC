@@ -14,6 +14,7 @@ APP = "UOL QHPC Cricket Stats"
 STATS_FROM = "28 October 2026"   # shown at the top of every page
 GRAPHICS_VERSION = "4"   # bump when the PNG layouts change, so no old cached image is served
 LOGO = os.path.join(os.path.dirname(__file__), "assets", "logo.png")  # optional: drop your logo here
+SITE = "uol-qhpc-cricket-db.streamlit.app"   # shown on the match-summary graphic; change if the link changes
 
 CSS = f"""
 <style>
@@ -595,3 +596,115 @@ def table_png(title, subtitle, columns, rows, scope="", footer_right="", top=3):
             x += w
         y += row_h
     return _finish(img, d, pal, scope, footer_right)
+
+
+def match_summary_png(s):
+    """Social-media match summary, 1080×1350. s: dict(title, subtitle, teams=[dict(name, score, overs, ours)],
+    result, star=dict(label, name, line, pts) or None, batters/bowlers=[(name, value, sub, detail)],
+    scope, footer_right)."""
+    W, H, P, band, foot = 1080, 1350, 64, 262, 112
+    from PIL import Image, ImageDraw
+    pal = {k: _hex(v) for k, v in (("deep", DEEP), ("mid", MID), ("bright", BRIGHT), ("tint", TINT),
+                                   ("pale", PALE), ("ink", INK), ("muted", MUTED))}
+    pal.update(mint=_hex("#8FD4B0"), white=(255, 255, 255), soft=(205, 233, 217), line=_hex("#E1EEE6"))
+    img = Image.new("RGB", (W, H), pal["white"])
+    d = ImageDraw.Draw(img)
+
+    # masthead
+    d.rectangle([0, 0, W, band], fill=pal["deep"])
+    d.rectangle([0, 0, W, 14], fill=pal["bright"])
+    logo_w = 0
+    if os.path.exists(LOGO):
+        try:
+            logo = Image.open(LOGO).convert("RGBA")
+            logo.thumbnail((120, 120))
+            img.paste(logo, (W - P - logo.width, 50), logo)
+            logo_w = logo.width + 24
+        except Exception:
+            pass
+    _spaced(d, (P, 46), "UOL · QALANDARS HIGH PERFORMANCE CENTRE", _font("bold", 22), pal["mint"], 3.2)
+    _spaced(d, (P, 84), "MATCH SUMMARY", _font("bold", 24), pal["soft"], 4)
+    tf = _fit(d, s["title"], "serif", 66, W - 2 * P - logo_w, 36)
+    d.text((P, 118), _ellipsize(d, s["title"], tf, W - 2 * P - logo_w), font=tf, fill=pal["white"])
+    sf = _fit(d, s["subtitle"], "regular", 28, W - 2 * P, 20)
+    d.text((P, 204), _ellipsize(d, s["subtitle"], sf, W - 2 * P), font=sf, fill=pal["soft"])
+
+    # scoreboard
+    y = band + 30
+    row_h, gap = 116, 14
+    for t in s["teams"][:2]:
+        fill = pal["tint"] if t.get("ours") else pal["pale"]
+        d.rounded_rectangle([P, y, W - P, y + row_h], radius=18, fill=fill)
+        if t.get("ours"):
+            d.rectangle([P, y + 16, P + 8, y + row_h - 16], fill=pal["bright"])
+        score = t.get("score") or "—"
+        sfont = _fit(d, score, "bold", 66, 470, 34)
+        sw = d.textlength(score, font=sfont)
+        ov = t.get("overs") or ""
+        ofont = _font("regular", 24)
+        _text_mid(d, W - P - 30 - sw, y + (48 if ov else row_h / 2), score, sfont, pal["deep"])
+        if ov:
+            d.text((W - P - 30 - d.textlength(ov, font=ofont), y + 80), ov, font=ofont, fill=pal["muted"])
+        avail = W - P - 30 - sw - 40 - (P + 36)
+        nfont = _fit(d, t["name"], "bold", 38, avail, 24)
+        _text_mid(d, P + 36, y + row_h / 2, _ellipsize(d, t["name"], nfont, avail), nfont, pal["ink"])
+        y += row_h + gap
+
+    # result banner
+    res = s.get("result") or ""
+    if res:
+        y += 6
+        d.rounded_rectangle([P, y, W - P, y + 72], radius=36, fill=pal["deep"])
+        rf = _fit(d, res, "bold", 32, W - 2 * P - 60, 20)
+        res_t = _ellipsize(d, res, rf, W - 2 * P - 60)
+        _text_mid(d, (W - d.textlength(res_t, font=rf)) / 2, y + 36, res_t, rf, pal["white"])
+        y += 72 + 26
+    else:
+        y += 12
+
+    # star performer
+    st_ = s.get("star")
+    if st_:
+        h = 176
+        d.rounded_rectangle([P, y, W - P, y + h], radius=18, fill=pal["pale"], outline=pal["tint"], width=3)
+        d.rectangle([P, y + 18, P + 8, y + h - 18], fill=pal["bright"])
+        _spaced(d, (P + 36, y + 24), st_["label"].upper(), _font("bold", 22), pal["mid"], 3)
+        pts = st_.get("pts") or ""
+        pf = _font("bold", 26)
+        pw = d.textlength(pts, font=pf) + 40 if pts else 0
+        if pts:
+            d.rounded_rectangle([W - P - 28 - pw, y + 18, W - P - 28, y + 62], radius=22, fill=pal["bright"])
+            _text_mid(d, W - P - 28 - pw + 20, y + 40, pts, pf, pal["white"])
+        nf = _fit(d, st_["name"], "serif", 56, W - 2 * P - 72, 30)
+        d.text((P + 36, y + 58), _ellipsize(d, st_["name"], nf, W - 2 * P - 72), font=nf, fill=pal["deep"])
+        lf = _fit(d, st_["line"], "regular", 30, W - 2 * P - 72, 20)
+        d.text((P + 36, y + 128), _ellipsize(d, st_["line"], lf, W - 2 * P - 72), font=lf, fill=_hex("#44544C"))
+        y += h + 28
+
+    # top batters | top bowlers
+    bottom = H - foot - 22
+    colw = (W - 2 * P - 32) / 2
+    for i, (title, rows) in enumerate((("TOP BATTERS", s.get("batters") or []), ("TOP BOWLERS", s.get("bowlers") or []))):
+        x0 = P + i * (colw + 32)
+        _spaced(d, (x0, y), title, _font("bold", 23), pal["mid"], 3)
+        d.rectangle([x0, y + 36, x0 + colw, y + 39], fill=pal["bright"])
+        ry = y + 52
+        rh = min(96, (bottom - ry) / 3) if rows else 0
+        if not rows:
+            d.text((x0, ry + 10), "Not recorded", font=_font("regular", 26), fill=pal["muted"])
+        for j, (name, val, sub, det) in enumerate(rows[:3]):
+            if j % 2 == 0:
+                d.rounded_rectangle([x0, ry, x0 + colw, ry + rh - 6], radius=12, fill=pal["pale"])
+            vf = _font("bold", 40 if rh >= 84 else 34)
+            vw = d.textlength(str(val), font=vf)
+            subf = _font("regular", 20)
+            right = x0 + colw - 18
+            _text_mid(d, right - vw, ry + (rh - 6) * (0.4 if sub else 0.5), str(val), vf, pal["deep"])
+            if sub:
+                d.text((right - d.textlength(sub, font=subf), ry + (rh - 6) * 0.68), sub, font=subf, fill=pal["muted"])
+            avail = right - max(vw, d.textlength(sub or "", font=subf)) - 20 - (x0 + 20)
+            nf, df = _fit(d, name, "bold", 29 if rh >= 84 else 25, avail, 22), _font("regular", 20)
+            _text_mid(d, x0 + 20, ry + (rh - 6) * 0.36, _ellipsize(d, name, nf, avail), nf, pal["ink"])
+            _text_mid(d, x0 + 20, ry + (rh - 6) * 0.72, _ellipsize(d, det, df, avail), df, pal["muted"])
+            ry += rh
+    return _finish(img, d, pal, s.get("scope", ""), s.get("footer_right", ""))
