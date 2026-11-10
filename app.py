@@ -1748,8 +1748,8 @@ def match_summary_data(r):
     toss = r.get("toss") or ""
     return {"title": title, "subtitle": subtitle, "teams": teams, "result": result, "star": star,
             "batters": bat_rows[:3], "bowlers": bowl_rows[:3],
-            "scope": f"Toss: {toss}" if toss else "Performance Analysis Department",
-            "footer_right": ui.SITE}, b, w
+            "scope": f"Toss: {toss}" if toss else "",
+            "footer_right": "Performance Analysis Department"}, b, w
 
 
 @st.cache_data(show_spinner=False)
