@@ -633,7 +633,7 @@ def build_card(name, pb, pw, field_f, mp, teams, n_matches, fmts):
                              ("Player of Match", potm), ("Matches", n_matches), ("Innings", int(w["Inns"]))])
     sections = [s_ for s_ in ((bat if not pb.empty else more), (bowl if not pw.empty else more))]
     extra = " · ".join(x for x in [f"Fielding: {catches} catch{'es' if catches != 1 else ''}",
-                                   f"Player of the Match {potm}×" if potm else ""] if x)
+                                   f"Player of the Match {potm} time{'s' if potm != 1 else ''}" if potm else ""] if x)
     fmt_txt = fmts[0] if len(fmts) == 1 else (f"{len(fmts)} formats" if fmts else "")
     return {"name": name, "line": " · ".join(x for x in [", ".join(teams), f"{n_matches} match(es)", fmt_txt] if x),
             "mvp": mvp_line, "sections": sections, "extra": extra,
@@ -1688,6 +1688,39 @@ def _short_sides(a, b):
     return " ".join(wa[i:]) or a, " ".join(wb[i:]) or b
 
 
+def _short_opp(name):
+    """Opposition on the result line: the first two words — 'TOWNSHIP WHITE CRICKET CLUB' -> 'TOWNSHIP WHITE'."""
+    w = str(name).split()
+    return " ".join(w[:2]) if len(w) > 2 else str(name)
+
+
+def _result_line(r, names, side):
+    """'QHPC JUNIOR won by 5 runs' / 'TOWNSHIP WHITE won by 1 wicket' / 'Match drawn'. Our team is always
+    written in full; the opposition by its first two words. The margin comes from the scorecard."""
+    raw = str(r.get("result") or "").strip()
+    low, out = raw.lower(), r["outcome_label"]
+    if out == "Tied" or re.search(r"\btied\b", low):
+        return "Match tied"
+    if out == "Drawn" or "drawn" in low:
+        return "Match drawn"
+    if out == "No result" or "no result" in low or "abandon" in low:
+        return "No result"
+    mm = re.search(r"\bwon\b(.*)$", raw, re.I)
+    margin = mm.group(1).strip() if mm else ""          # "by 1 wicket"
+    won = f"won {margin}".strip()
+    if side in ("A", "B") and out in ("Won", "Lost"):
+        other = "B" if side == "A" else "A"
+        return f"{names[side]} {won}" if out == "Won" else f"{_short_opp(names[other])} {won}"
+    if mm:                                              # intra-squad / no outcome set: find the winner by name
+        pre = raw[:mm.start()].strip().lower()
+        for k in ("A", "B"):
+            full = str(r[f"team_{k.lower()}"]).lower()
+            if pre and (pre in full or full in pre):
+                name = names[k]
+                return f"{name if side in (k, 'AB') else _short_opp(name)} {won}"
+    return raw
+
+
 def match_summary_data(r):
     """Everything for one match's summary: header, both scores, result, star performer and the
     top batters / bowlers (our players — both sides in an intra-squad game)."""
@@ -1716,9 +1749,7 @@ def match_summary_data(r):
         title = f"{names[side]} vs {names['B' if side == 'A' else 'A']}"
     else:
         title = f"{names['A']} vs {names['B']}"
-    result = str(r["result"] or "").strip()
-    if not result and r["outcome_label"] in ("Won", "Lost"):
-        result = f"{names[side]} {'won' if r['outcome_label'] == 'Won' else 'lost'}"
+    result = _result_line(r, names, side)
     bits = [r["format_label"] if r["format_label"] != NO_FORMAT else "",
             r["ball_label"] if r["ball_label"] != NOT_SET else "",
             f"{r['date_dt']:%d %b %Y}" if pd.notna(r["date_dt"]) else "",
@@ -1729,7 +1760,8 @@ def match_summary_data(r):
         return f"{tags.get(t, '')} · " if tags.get(t) else ""
     bat_rows, bowl_rows = [], []
     for x in b.sort_values(["runs", "balls"], ascending=[False, True]).itertuples():
-        extra = [f"{int(x.fours)}×4" if x.fours else "", f"{int(x.sixes)}×6" if x.sixes else "",
+        extra = [f"{int(x.fours)} four{'s' if x.fours != 1 else ''}" if x.fours else "",
+                 f"{int(x.sixes)} six{'es' if x.sixes != 1 else ''}" if x.sixes else "",
                  f"SR {100 * x.runs / x.balls:.1f}" if x.balls else ""]
         bat_rows.append((x.player, f"{int(x.runs)}{'*' if x.how_out == 'not out' else ''}", f"{int(x.balls)} balls",
                          tag(x.team) + (" · ".join(e for e in extra if e) or str(x.how_out))))
