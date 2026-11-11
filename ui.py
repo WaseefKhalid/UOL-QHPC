@@ -636,6 +636,9 @@ def match_summary_png(s):
     sf = _fit(d, s["subtitle"], "regular", 28, W - 2 * P, 20)
     d.text((P, sub_y), _ellipsize(d, s["subtitle"], sf, W - 2 * P), font=sf, fill=pal["soft"])
 
+    if s.get("sides"):
+        return _summary_intra(img, d, pal, s, band, W, H, P, foot)
+
     # scoreboard
     y = band + 30
     row_h, gap = 116, 14
@@ -714,4 +717,83 @@ def match_summary_png(s):
             _text_mid(d, x0 + 20, ry + (rh - 6) * 0.36, _ellipsize(d, name, nf, avail), nf, pal["ink"])
             _text_mid(d, x0 + 20, ry + (rh - 6) * 0.72, _ellipsize(d, det, df, avail), df, pal["muted"])
             ry += rh
+    return _finish(img, d, pal, s.get("scope", ""), s.get("footer_right", ""))
+
+
+def _summary_rows(d, pal, rows, x0, y, colw, rh, empty="Not recorded"):
+    """Compact performer rows (name + detail on the left, value + sub on the right). Returns the new y."""
+    if not rows:
+        d.text((x0 + 4, y + 8), empty, font=_font("regular", 22), fill=pal["muted"])
+        return y + rh
+    for j, (name, val, sub, det) in enumerate(rows[:3]):
+        if j % 2 == 0:
+            d.rounded_rectangle([x0, y, x0 + colw, y + rh - 6], radius=10, fill=pal["pale"])
+        right = x0 + colw - 16
+        vf, subf = _font("bold", 32), _font("regular", 18)
+        vw = d.textlength(str(val), font=vf)
+        _text_mid(d, right - vw, y + (rh - 6) * 0.38, str(val), vf, pal["deep"])
+        if sub:
+            d.text((right - d.textlength(sub, font=subf), y + (rh - 6) * 0.66), sub, font=subf, fill=pal["muted"])
+        avail = right - max(vw, d.textlength(sub or "", font=subf)) - 18 - (x0 + 16)
+        nf, df = _fit(d, name, "bold", 25, avail, 19), _font("regular", 18)
+        _text_mid(d, x0 + 16, y + (rh - 6) * 0.34, _ellipsize(d, name, nf, avail), nf, pal["ink"])
+        if det:
+            _text_mid(d, x0 + 16, y + (rh - 6) * 0.72, _ellipsize(d, det, df, avail), df, pal["muted"])
+        y += rh
+    return y
+
+
+def _summary_intra(img, d, pal, s, band, W, H, P, foot):
+    """Intra-squad layout: both sides are ours, so one column per side — its score, top 3 batters and
+    top 3 bowlers — under the result and the player of the match."""
+    y = band + 26
+    res = s.get("result") or ""
+    if res:
+        d.rounded_rectangle([P, y, W - P, y + 68], radius=34, fill=pal["deep"])
+        rf = _fit(d, res, "bold", 32, W - 2 * P - 60, 20)
+        res_t = _ellipsize(d, res, rf, W - 2 * P - 60)
+        _text_mid(d, (W - d.textlength(res_t, font=rf)) / 2, y + 34, res_t, rf, pal["white"])
+        y += 68 + 20
+    st_ = s.get("star")
+    if st_:
+        h = 132
+        d.rounded_rectangle([P, y, W - P, y + h], radius=18, fill=pal["pale"], outline=pal["tint"], width=3)
+        d.rectangle([P, y + 16, P + 8, y + h - 16], fill=pal["bright"])
+        _spaced(d, (P + 34, y + 18), st_["label"].upper(), _font("bold", 20), pal["mid"], 3)
+        pts = st_.get("pts") or ""
+        pf = _font("bold", 24)
+        pw = d.textlength(pts, font=pf) + 36 if pts else 0
+        if pts:
+            d.rounded_rectangle([W - P - 24 - pw, y + 16, W - P - 24, y + 56], radius=20, fill=pal["bright"])
+            _text_mid(d, W - P - 24 - pw + 18, y + 36, pts, pf, pal["white"])
+        nf = _fit(d, st_["name"], "serif", 46, W - 2 * P - 68 - pw, 28)
+        d.text((P + 34, y + 46), _ellipsize(d, st_["name"], nf, W - 2 * P - 68 - pw), font=nf, fill=pal["deep"])
+        lf = _fit(d, st_["line"], "regular", 26, W - 2 * P - 68, 18)
+        d.text((P + 34, y + 96), _ellipsize(d, st_["line"], lf, W - 2 * P - 68), font=lf, fill=_hex("#44544C"))
+        y += h + 24
+
+    bottom = H - foot - 20
+    colw = (W - 2 * P - 28) / 2
+    for i, side in enumerate(s["sides"][:2]):
+        x0 = P + i * (colw + 28)
+        # team panel: name + score
+        ph = 112
+        d.rounded_rectangle([x0, y, x0 + colw, y + ph], radius=16, fill=pal["tint"])
+        d.rectangle([x0, y + 14, x0 + 7, y + ph - 14], fill=pal["bright"])
+        nf = _fit(d, side["name"], "bold", 28, colw - 40, 18)
+        d.text((x0 + 24, y + 14), _ellipsize(d, side["name"], nf, colw - 40), font=nf, fill=pal["ink"])
+        score = side.get("score") or "—"
+        sf = _fit(d, score, "bold", 50, colw - 40 - 150, 28)
+        d.text((x0 + 24, y + 50), score, font=sf, fill=pal["deep"])
+        ov = side.get("overs") or ""
+        if ov:
+            of = _font("regular", 22)
+            d.text((x0 + colw - 20 - d.textlength(ov, font=of), y + 70), ov, font=of, fill=pal["muted"])
+        cy = y + ph + 18
+        left = bottom - cy - 2 * 34 - 12
+        rh = max(52, min(70, left / 6))
+        for label, rows in (("TOP BATTERS", side.get("batters") or []), ("TOP BOWLERS", side.get("bowlers") or [])):
+            _spaced(d, (x0, cy), label, _font("bold", 19), pal["mid"], 2.6)
+            d.rectangle([x0, cy + 26, x0 + colw, cy + 28], fill=pal["bright"])
+            cy = _summary_rows(d, pal, rows, x0, cy + 34, colw, rh) + 12
     return _finish(img, d, pal, s.get("scope", ""), s.get("footer_right", ""))
