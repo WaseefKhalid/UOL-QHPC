@@ -1764,22 +1764,37 @@ def match_summary_data(r):
                  f"{int(x.sixes)} six{'es' if x.sixes != 1 else ''}" if x.sixes else "",
                  f"SR {100 * x.runs / x.balls:.1f}" if x.balls else ""]
         bat_rows.append((x.player, f"{int(x.runs)}{'*' if x.how_out == 'not out' else ''}", f"{int(x.balls)} balls",
-                         tag(x.team) + (" · ".join(e for e in extra if e) or str(x.how_out))))
+                         tag(x.team) + (" · ".join(e for e in extra if e) or str(x.how_out)), x.team))
     for x in w.sort_values(["wickets", "runs"], ascending=[False, True]).itertuples():
         extra = [f"Econ {x.econ:.2f}" if pd.notna(x.econ) and x.overs else "",
                  f"{int(x.maidens)} maiden{'s' if x.maidens > 1 else ''}" if x.maidens else ""]
         bowl_rows.append((x.player, f"{int(x.wickets)}/{int(x.runs)}", f"{x.overs:g} ov",
-                          tag(x.team) + " · ".join(e for e in extra if e)))
+                          tag(x.team) + " · ".join(e for e in extra if e), x.team))
     star = None
     mp = match_points(b, w, f)
     if not mp.empty:
         best = players_of_match(mp).iloc[0]
+        line = re.sub(r"(\d+) ct\b", lambda mm: f"{mm.group(1)} catch{'es' if mm.group(1) != '1' else ''}",
+                      str(best["performance"]).replace(" & ", " · "))
+        if intra:                                    # say which side he played for
+            his = pd.concat([b[b["player"] == best["player"]]["team"], w[w["player"] == best["player"]]["team"],
+                             f[f["player"] == best["player"]]["team"]])
+            if not his.empty:
+                line += f" · {his.iloc[0]}"
         star = {"label": "Player of the match" if intra else "Star performer", "name": best["player"],
-                "line": str(best["performance"]).replace(" & ", " · ").replace(" ct", " catch"),
-                "pts": f"{int(round(best['total']))} MVP pts"}
+                "line": line, "pts": f"{int(round(best['total']))} MVP pts"}
     toss = r.get("toss") or ""
+    sides = None
+    if intra:       # both sides are ours: top 3 batters and bowlers of EACH side, side by side
+        sides = []
+        for k, t in zip(("A", "B"), teams):
+            raw = r[f"team_{k.lower()}"]
+            sides.append({**t, "batters": [x[:3] + (x[3].replace(tag(raw), "", 1),) for x in bat_rows
+                                           if x[4] == raw][:3],
+                          "bowlers": [x[:3] + (x[3].replace(tag(raw), "", 1),) for x in bowl_rows
+                                      if x[4] == raw][:3]})
     return {"title": title, "subtitle": subtitle, "teams": teams, "result": result, "star": star,
-            "batters": bat_rows[:3], "bowlers": bowl_rows[:3],
+            "batters": [x[:4] for x in bat_rows[:3]], "bowlers": [x[:4] for x in bowl_rows[:3]], "sides": sides,
             "scope": f"Toss: {toss}" if toss else "",
             "footer_right": "Performance Analysis Department"}, b, w
 
